@@ -43,3 +43,4 @@ todos/
 CLAUDE.md
 scripts/release.local
 docs/
+scripts/research/__pycache__/
