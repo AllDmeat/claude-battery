@@ -72,7 +72,8 @@ public sealed class ClaudeAuthException : Exception
     /// the poller (U4) backs off on the other two. Derived from headers, plus a bool-only read of a
     /// small JSON 403 body for <see cref="AuthFailureKind.RegionUnavailable"/>; nothing else from the
     /// response is retained (redaction gate). Defaults to <see cref="AuthFailureKind.Session"/>, so
-    /// a block is never assumed where the tells are not computed.
+    /// a block is never assumed where the tells are not computed. When a response carries both a
+    /// region body and a Cloudflare tell, <see cref="AuthFailureKind.RegionUnavailable"/> wins.
     /// </summary>
     public AuthFailureKind Kind { get; }
 

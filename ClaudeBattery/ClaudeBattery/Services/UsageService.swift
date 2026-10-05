@@ -33,10 +33,19 @@ enum UsagePollError: LocalizedError, Equatable {
     /// The error a non-2xx usage answer means, or nil when it is an ordinary failure.
     static func from(statusCode: Int, body: Data) -> UsagePollError? {
         switch statusCode {
-        case 403 where UsageService.isRegionUnavailable(body): .regionUnavailable
+        case 403 where isRegionUnavailable(body): .regionUnavailable
         case 401, 403: .sessionExpired
         default: nil
         }
+    }
+
+    /// True for claude.ai's `{"error":{"details":{"error_code":"region_unavailable"}}}` body.
+    static func isRegionUnavailable(_ data: Data) -> Bool {
+        struct Body: Decodable {
+            struct Err: Decodable { struct Details: Decodable { let error_code: String? }; let details: Details? }
+            let error: Err?
+        }
+        return (try? JSONDecoder().decode(Body.self, from: data))?.error?.details?.error_code == "region_unavailable"
     }
 }
 
@@ -258,7 +267,9 @@ class UsageService: NSObject, ObservableObject {
 
             if error == .regionUnavailable {
                 consecutiveFailures += 1
-                if pollError != error { pollError = error }
+                // An expired session stays expired: the region check comes first on the server, so
+                // this answer says nothing about whether the session recovered.
+                if pollError == nil { pollError = .regionUnavailable }
                 logger.warning("Region unavailable (HTTP 403), backing off")
                 return
             }
@@ -398,15 +409,6 @@ class UsageService: NSObject, ObservableObject {
     }
 
     var onAuthFailure: (() -> Void)?
-
-    /// True for claude.ai's `{"error":{"details":{"error_code":"region_unavailable"}}}` body.
-    nonisolated static func isRegionUnavailable(_ data: Data) -> Bool {
-        struct Body: Decodable {
-            struct Err: Decodable { struct Details: Decodable { let error_code: String? }; let details: Details? }
-            let error: Err?
-        }
-        return (try? JSONDecoder().decode(Body.self, from: data))?.error?.details?.error_code == "region_unavailable"
-    }
 
     // MARK: - Notifications
 

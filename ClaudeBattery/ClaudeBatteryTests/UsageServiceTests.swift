@@ -851,6 +851,32 @@ final class UsageServicePollTests: XCTestCase {
         XCTAssertNil(service.pollError, "switchAccount should clear the region error")
     }
 
+    /// Once expired, only a success or an account switch clears it: neither a region 403 nor a 500
+    /// may turn "Sign In Again" into the VPN card or restart polling.
+    @MainActor
+    func testSessionExpired_isStickyAcrossRegionAnd500() async {
+        mockSession.responseData = Data()
+        mockSession.responseStatusCode = 403
+
+        let service = UsageService(
+            storage: storage,
+            accountStore: accountStore,
+            session: mockSession
+        )
+
+        await service.pollUsage()
+        XCTAssertEqual(service.pollError, .sessionExpired)
+
+        mockSession.responseData = regionUnavailableBody
+        await service.pollUsage()
+        XCTAssertEqual(service.pollError, .sessionExpired)
+
+        mockSession.responseData = Data()
+        mockSession.responseStatusCode = 500
+        await service.pollUsage()
+        XCTAssertEqual(service.pollError, .sessionExpired)
+    }
+
     func testPollError_fromStatusAndBody() {
         XCTAssertEqual(UsagePollError.from(statusCode: 403, body: regionUnavailableBody), .regionUnavailable)
         XCTAssertEqual(UsagePollError.from(statusCode: 403, body: Data()), .sessionExpired)
@@ -860,10 +886,10 @@ final class UsageServicePollTests: XCTestCase {
     }
 
     func testIsRegionUnavailable_onlyMatchesTheRegionCode() {
-        XCTAssertTrue(UsageService.isRegionUnavailable(regionUnavailableBody))
-        XCTAssertFalse(UsageService.isRegionUnavailable(Data(#"{"type":"error","error":{"type":"permission_error","message":"Invalid authorization","details":{"error_code":"account_session_invalid"}}}"#.utf8)))
-        XCTAssertFalse(UsageService.isRegionUnavailable(Data("<!DOCTYPE html><title>Just a moment...</title>".utf8)))
-        XCTAssertFalse(UsageService.isRegionUnavailable(Data()))
+        XCTAssertTrue(UsagePollError.isRegionUnavailable(regionUnavailableBody))
+        XCTAssertFalse(UsagePollError.isRegionUnavailable(Data(#"{"type":"error","error":{"type":"permission_error","message":"Invalid authorization","details":{"error_code":"account_session_invalid"}}}"#.utf8)))
+        XCTAssertFalse(UsagePollError.isRegionUnavailable(Data("<!DOCTYPE html><title>Just a moment...</title>".utf8)))
+        XCTAssertFalse(UsagePollError.isRegionUnavailable(Data()))
     }
 
     // MARK: - 500 server error
