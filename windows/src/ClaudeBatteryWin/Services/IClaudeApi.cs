@@ -78,6 +78,14 @@ public sealed class ClaudeAuthException : Exception
     public bool LooksLikeCloudflareBlock { get; }
 
     /// <summary>
+    /// True for a 403 whose JSON body carries <c>error.details.error_code == "region_unavailable"</c>:
+    /// claude.ai refusing an unsupported region (a VPN that dropped), not an expired session. The
+    /// poller backs off and keeps polling instead of asking for a re-login. Only this bool leaves
+    /// the body read; nothing from the body is retained (redaction gate).
+    /// </summary>
+    public bool IsRegionUnavailable { get; }
+
+    /// <summary>
     /// Back-compat ctor for every existing 401/403 throw + test call site: defaults the Cloudflare
     /// signal to <c>false</c> so behavior is unchanged where the tell is not computed.
     /// </summary>
@@ -86,10 +94,11 @@ public sealed class ClaudeAuthException : Exception
     {
     }
 
-    public ClaudeAuthException(int statusCode, bool looksLikeCloudflareBlock)
+    public ClaudeAuthException(int statusCode, bool looksLikeCloudflareBlock, bool isRegionUnavailable = false)
         : base($"claude.ai returned HTTP {statusCode} (authentication failure)")
     {
         StatusCode = statusCode;
         LooksLikeCloudflareBlock = looksLikeCloudflareBlock;
+        IsRegionUnavailable = isRegionUnavailable;
     }
 }

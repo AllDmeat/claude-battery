@@ -578,6 +578,16 @@ public sealed class UsageService : IDisposable
                 // U3/U5), a later block backs off (network-like), and NEITHER sets authFailed nor fires
                 // AuthFailureDetected (prompting re-login on a CF block would be wrong - KTD4). A
                 // genuine 401, or a 403 WITHOUT the Cloudflare tell, still hard-stops as before.
+                // A region refusal (a VPN that dropped, `region_unavailable`) is not an auth failure
+                // either: re-login cannot clear it, and the VPN usually comes back on its own. Back
+                // off like a network failure, with the same first-poll-after-resume grace (a VPN
+                // still reconnecting after wake), and never escalate to the auth-failed surface.
+                if (ex.StatusCode == 403 && ex.IsRegionUnavailable)
+                {
+                    if (!tolerateNoNetwork) RecordHardFailure(dispatchGeneration, dispatchSuspendEpoch, cancellationToken);
+                    return;
+                }
+
                 var cfBlock = ex.StatusCode == 403 && ex.LooksLikeCloudflareBlock;
                 if (cfBlock)
                 {
