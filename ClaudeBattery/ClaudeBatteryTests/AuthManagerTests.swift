@@ -3957,7 +3957,7 @@ final class AuthManagerTests: XCTestCase {
         var requested: ManualSignInReason?
         auth.onManualSignInRequested = { requested = $0 }
 
-        auth.overlaySSOManualTapped()
+        auth.ssoManualSignInTapped()
 
         XCTAssertEqual(requested, .singleSignOn)
         XCTAssertEqual(auth.loginState, .idle)
@@ -3975,7 +3975,7 @@ final class AuthManagerTests: XCTestCase {
         XCTAssertTrue(accessory.isHidden)
         let button = accessory.view.subviews.compactMap { $0 as? NSButton }.first
         XCTAssertEqual(button?.title, "Sign in manually instead")
-        XCTAssertEqual(button?.action, #selector(AuthManager.manualSignInLinkTapped))
+        XCTAssertEqual(button?.action, #selector(AuthManager.ssoManualSignInTapped))
     }
 
     @MainActor
@@ -4018,7 +4018,7 @@ final class AuthManagerTests: XCTestCase {
         var requested: ManualSignInReason?
         auth.onManualSignInRequested = { requested = $0 }
 
-        auth.manualSignInLinkTapped()
+        auth.ssoManualSignInTapped()
 
         XCTAssertEqual(requested, .singleSignOn)
         XCTAssertNil(auth.loginWebView, "The sign-in window is torn down")

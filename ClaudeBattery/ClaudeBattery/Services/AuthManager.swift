@@ -666,7 +666,7 @@ class AuthManager: NSObject, ObservableObject {
         retry.bezelStyle = .rounded
 
         let manual = NSButton(title: "Sign in manually", target: self,
-                              action: singleSignOn ? #selector(overlaySSOManualTapped) : #selector(overlayManualTapped))
+                              action: singleSignOn ? #selector(ssoManualSignInTapped) : #selector(overlayManualTapped))
         manual.bezelStyle = .rounded
 
         let defaultButton = singleSignOn ? manual : retry
@@ -699,16 +699,10 @@ class AuthManager: NSObject, ObservableObject {
         requestManualSignIn(.general)
     }
 
-    /// The SSO card's "Sign in manually" (issue #49): the same close-and-route, with Settings
-    /// guiding the user to the paste field.
+    /// The SSO card's "Sign in manually" and the title-bar link (issue #49): the same
+    /// close-and-route, with Settings guiding the user to the paste field.
     // internal for @testable access in AuthManagerTests
-    @objc func overlaySSOManualTapped() {
-        requestManualSignIn(.singleSignOn)
-    }
-
-    /// The title-bar link: the same close-and-route as the SSO card's "Sign in manually".
-    // internal for @testable access in AuthManagerTests
-    @objc func manualSignInLinkTapped() {
+    @objc func ssoManualSignInTapped() {
         requestManualSignIn(.singleSignOn)
     }
 
@@ -716,7 +710,7 @@ class AuthManager: NSObject, ObservableObject {
     /// title bar. Starts hidden; `updateManualSignInLink` shows it.
     static func makeManualSignInLinkAccessory(target: AuthManager) -> NSTitlebarAccessoryViewController {
         let button = NSButton(title: "Sign in manually instead", target: target,
-                              action: #selector(manualSignInLinkTapped))
+                              action: #selector(ssoManualSignInTapped))
         button.isBordered = false
         button.font = .preferredFont(forTextStyle: .callout)
         button.attributedTitle = NSAttributedString(string: button.title, attributes: [
@@ -743,8 +737,12 @@ class AuthManager: NSObject, ObservableObject {
     /// the sign-in is idle: never over "Finishing sign-in" or the error card, which has its own
     /// "Sign in manually".
     private func updateManualSignInLink() {
+        guard let accessory = manualSignInLinkAccessory else { return }
         let onSSOPage = lastAllowedMainFrameHost.map(Self.isSSONavigationHost) ?? false
-        manualSignInLinkAccessory?.isHidden = !(ssoSignInActive && onSSOPage && loginState == .idle)
+        let hide = !(ssoSignInActive && onSSOPage && loginState == .idle)
+        // Every login-state assignment lands here; skip unchanged writes so the title bar is not
+        // laid out again for nothing.
+        if accessory.isHidden != hide { accessory.isHidden = hide }
     }
 
     private func requestManualSignIn(_ reason: ManualSignInReason) {
@@ -2186,8 +2184,7 @@ extension AuthManager: WKNavigationDelegate {
             // U6 diagnostics: decision + host only (never url.absoluteString — it may carry
             // query params). Written to the exported diag-*.jsonl through the same injected
             // sink as the block branch, so a test can read both decisions back. The host goes
-            // through the same validator as a blocked one (issue #49), since an SSO sign-in now
-            // records every allowed hop.
+            // through the same validator as a blocked one (issue #49).
             diagnostics.emitMilestone(kind: "nav-decision", payload: ["decision": "allow", "host": Self.hostForDiagnostics(host)])
             decisionHandler(.allow)
         } else {

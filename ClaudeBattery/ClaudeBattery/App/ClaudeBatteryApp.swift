@@ -13,8 +13,6 @@ struct ClaudeBatteryApp: App {
                 SettingsView(
                     accountStore: accountStore,
                     authManager: authManager,
-                    // Only the menu bar's Settings window receives guided sign-in requests.
-                    manualSignInGuide: ManualSignInGuide(),
                     closeWindow: { NSApp.keyWindow?.close() }
                 )
             }

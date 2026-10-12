@@ -6,7 +6,8 @@ import UserNotifications
 struct SettingsView: View {
     @ObservedObject var accountStore: AccountStore
     let authManager: AuthManager
-    @ObservedObject var manualSignInGuide: ManualSignInGuide
+    /// Only the menu bar's Settings window passes its guide in; the default never gets a request.
+    @ObservedObject var manualSignInGuide = ManualSignInGuide()
     let closeWindow: () -> Void
 
     @State private var launchAtLogin = false
