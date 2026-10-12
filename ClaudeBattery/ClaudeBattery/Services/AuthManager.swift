@@ -2185,8 +2185,10 @@ extension AuthManager: WKNavigationDelegate {
             }
             // U6 diagnostics: decision + host only (never url.absoluteString — it may carry
             // query params). Written to the exported diag-*.jsonl through the same injected
-            // sink as the block branch, so a test can read both decisions back.
-            diagnostics.emitMilestone(kind: "nav-decision", payload: ["decision": "allow", "host": host])
+            // sink as the block branch, so a test can read both decisions back. The host goes
+            // through the same validator as a blocked one (issue #49), since an SSO sign-in now
+            // records every allowed hop.
+            diagnostics.emitMilestone(kind: "nav-decision", payload: ["decision": "allow", "host": Self.hostForDiagnostics(host)])
             decisionHandler(.allow)
         } else {
             let kind = Self.navigationBlockKind(

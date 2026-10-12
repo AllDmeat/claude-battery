@@ -3760,6 +3760,25 @@ final class AuthManagerTests: XCTestCase {
     }
 
     @MainActor
+    func testNavDecisionAllow_recordsValidatedHosts() {
+        // Issue #49 (R10): every host an SSO sign-in visits is in the export, validated the same
+        // way as blocked hosts, with no path or query.
+        let auth = makeAuthManager()
+        let login = makeLoginWebView()
+        auth.loginWebView = login
+        let diagnostics = makeDiagnostics()
+        auth.diagnostics = diagnostics
+
+        decide(auth, login, makeMainFrameAction("https://login.microsoftonline.com/t/oauth2/authorize?login_hint=LEAKED"))
+        // Allowed by the `.claude.ai` suffix, but not a valid host name.
+        XCTAssertEqual(decide(auth, login, makeSubframeAction("https://bad_host.claude.ai/frame")), .allow)
+
+        let decisions = records(kind: "nav-decision", from: diagnostics)
+        XCTAssertEqual(decisions.map { $0["host"] as? String }, ["login.microsoftonline.com", "(invalid)"])
+        XCTAssertTrue(decisions.allSatisfy { Set($0.keys) == ["decision", "host"] })
+    }
+
+    @MainActor
     func testCreateWebView_disallowedHost_returnsNilAndRecordsPopup() {
         // AE8: a script window.open on an identity-provider URL. No popup, same overlay, kind popup.
         let auth = makeAuthManager()
