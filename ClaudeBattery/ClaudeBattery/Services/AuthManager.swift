@@ -113,6 +113,13 @@ class AuthManager: NSObject, ObservableObject {
     /// blocked hop (the same `domain` and `code` every time) writes one `nav-failed` record
     /// instead of one per attempt. Cleared alongside `lastBlockedNavigation`.
     private var lastNavFailure: (domain: String, code: Int)?
+    /// Whether this attempt is inside a single sign-on (SSO) hand-off (issue #49). Set by an
+    /// allowed main-frame navigation to a WorkOS or Microsoft host, and cleared only by an allowed
+    /// main-frame claude.ai navigation, a retry, or teardown. Any other host leaves it alone, so a
+    /// WorkOS-to-Google hop keeps it. The web view's committed URL cannot stand in for it: a WorkOS
+    /// redirect never commits, so the URL still reads claude.ai.
+    // internal for @testable access in AuthManagerTests
+    private(set) var ssoSignInActive = false
     var onAuthSuccess: (() -> Void)?
     /// Hook the app wires to open Settings at the manual paste section (U5). Invoked by the
     /// sign-in error overlay's "Sign in manually" button so a stuck user reaches the floor.
@@ -496,6 +503,7 @@ class AuthManager: NSObject, ObservableObject {
         urlObservation = nil
         lastBlockedNavigation = nil
         lastNavFailure = nil
+        ssoSignInActive = false
         popupWebView?.stopLoading()
         popupWebView?.removeFromSuperview()
         popupWebView = nil
@@ -674,6 +682,7 @@ class AuthManager: NSObject, ObservableObject {
         pendingCookieHeader = nil
         lastBlockedNavigation = nil
         lastNavFailure = nil
+        ssoSignInActive = false
     }
 
     /// Reset capture state and reload claude.ai/login in the existing login WebView.
@@ -1903,6 +1912,30 @@ class AuthManager: NSObject, ObservableObject {
         host.hasSuffix(".hcaptcha.com")
     }
 
+    /// The hosts a claude.ai single sign-on (SSO) passes through on its way to a company's
+    /// Microsoft Entra sign-in and back (issue #49): WorkOS, which claude.ai hands SSO to, and the
+    /// Microsoft sign-in, password-reset and MFA-registration hosts a first-time or expired-password
+    /// sign-in reaches mid-flow. Exact hosts only, with no subdomains: none of them serves pages a
+    /// user can create. `login.live.com` (personal Microsoft accounts) is left out on purpose.
+    static let ssoNavigationHosts: Set<String> = [
+        "api.workos.com",
+        "auth.workos.com",
+        "login.microsoftonline.com",
+        "login.microsoft.com",
+        "login.windows.net",
+        "passwordreset.microsoftonline.com",
+        "mysignins.microsoft.com",
+        "account.activedirectory.windowsazure.com"
+    ]
+
+    /// Whether `host` is one of `ssoNavigationHosts`. Consulted for main-frame and subframe
+    /// navigation in the login window only, never for popups: a popup covers the whole login view
+    /// with no close control, so `allowsOAuthPopup` keeps `isAllowedDomain` alone.
+    // internal for @testable access in AuthManagerTests
+    static func isSSONavigationHost(_ host: String) -> Bool {
+        ssoNavigationHosts.contains(host)
+    }
+
     /// Whether a `window.open()` to `url` should spawn an OAuth popup. Pattern #7: the `about:`
     /// scheme check MUST precede the host check - `about:blank` (Google's OAuth bootstrap) has
     /// no host, so a host guard placed first would silently block it and break Google sign-in.
@@ -2041,8 +2074,21 @@ extension AuthManager: WKNavigationDelegate {
             return
         }
 
-        if isAllowedDomain(host) {
+        let onPopup = webView === popupWebView
+        let isMainFrame = navigationAction.targetFrame?.isMainFrame ?? false
+        // SSO hosts only in a frame of the login window: a nil target frame asks for a new
+        // window, and a popup may load only the original list.
+        let isSSOHost = !onPopup && navigationAction.targetFrame != nil && Self.isSSONavigationHost(host)
+
+        if isAllowedDomain(host) || isSSOHost {
             logger.debug("Navigation allowed: \(host)")
+            if isMainFrame && !onPopup {
+                if isSSOHost {
+                    ssoSignInActive = true
+                } else if host == "claude.ai" || host.hasSuffix(".claude.ai") {
+                    ssoSignInActive = false
+                }
+            }
             // U6 diagnostics: decision + host only (never url.absoluteString — it may carry
             // query params). Written to the exported diag-*.jsonl through the same injected
             // sink as the block branch, so a test can read both decisions back.
@@ -2050,10 +2096,10 @@ extension AuthManager: WKNavigationDelegate {
             decisionHandler(.allow)
         } else {
             let kind = Self.navigationBlockKind(
-                isMainFrame: navigationAction.targetFrame?.isMainFrame ?? false,
+                isMainFrame: isMainFrame,
                 targetFrameIsNil: navigationAction.targetFrame == nil,
                 navigationType: navigationAction.navigationType,
-                onPopup: webView === popupWebView
+                onPopup: onPopup
             )
             recordBlockedNavigation(host: host, kind: kind)
             decisionHandler(.cancel)

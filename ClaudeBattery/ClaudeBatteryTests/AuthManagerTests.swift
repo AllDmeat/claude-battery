@@ -824,6 +824,64 @@ final class AuthManagerTests: XCTestCase {
     }
 
     @MainActor
+    func testIsSSONavigationHost_exactWorkOSAndMicrosoftHostsOnly() {
+        // Issue #49: claude.ai's SSO hands off to WorkOS, then to Microsoft Entra. Exact hosts
+        // only, so a subdomain, a lookalike, or another company's login page stays blocked.
+        for host in ["api.workos.com", "auth.workos.com", "login.microsoftonline.com",
+                     "login.microsoft.com", "login.windows.net", "passwordreset.microsoftonline.com",
+                     "mysignins.microsoft.com", "account.activedirectory.windowsazure.com"] {
+            XCTAssertTrue(AuthManager.isSSONavigationHost(host), "\(host) should be allowed")
+        }
+        for host in ["api.workos.com.evil.com", "evilworkos.com", "workos.com", "x.api.workos.com",
+                     "x.auth.workos.com", "x.login.microsoftonline.com", "x.mysignins.microsoft.com",
+                     "microsoftonline.com", "forms.microsoft.com", "acme.okta.com", "x.authkit.app",
+                     "login.live.com"] {
+            XCTAssertFalse(AuthManager.isSSONavigationHost(host), "\(host) must be rejected")
+        }
+    }
+
+    @MainActor
+    func testDecidePolicy_ssoHosts_allowedInWindowButNeverAsNewWindows() {
+        let auth = makeAuthManager()
+        let login = makeLoginWebView()
+        auth.loginWebView = login
+
+        XCTAssertEqual(decide(auth, login, makeMainFrameAction("https://api.workos.com/sso/authorize")), .allow)
+        XCTAssertEqual(decide(auth, login, makeSubframeAction("https://login.microsoftonline.com/t/saml2")), .allow)
+        let samlPost = WebKitFakes.action(url: "https://auth.workos.com/sso/saml/acs", targetFrame: WebKitFakes.frame(isMainFrame: true),
+                                          navigationType: .formSubmitted)
+        XCTAssertEqual(decide(auth, login, samlPost), .allow, "Microsoft's answer posted back to WorkOS goes through")
+        XCTAssertEqual(decide(auth, login, makeNilTargetAction("https://login.microsoftonline.com/t", navigationType: .other)), .cancel,
+                       "A new window to an SSO host is still refused")
+        XCTAssertFalse(auth.allowsOAuthPopup(for: URL(string: "https://login.microsoftonline.com/t")!),
+                       "Popups keep the original list")
+
+        let popup = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        login.addSubview(popup)
+        auth.popupWebView = popup
+        auth.resetLoginAttemptState()
+        XCTAssertFalse(auth.ssoSignInActive, "A fresh attempt starts outside SSO")
+        XCTAssertEqual(decide(auth, popup, makeMainFrameAction("https://login.microsoftonline.com/t")), .cancel,
+                       "An open popup cannot load an SSO host either")
+        XCTAssertFalse(auth.ssoSignInActive)
+    }
+
+    @MainActor
+    func testDecidePolicy_ssoSignInActive_setByWorkOS_keptThroughGoogle_clearedByClaude() {
+        let auth = makeAuthManager()
+        let login = makeLoginWebView()
+        auth.loginWebView = login
+        XCTAssertFalse(auth.ssoSignInActive)
+
+        decide(auth, login, makeMainFrameAction("https://api.workos.com/sso/authorize"))
+        XCTAssertTrue(auth.ssoSignInActive)
+        decide(auth, login, makeMainFrameAction("https://accounts.google.com/o/saml2"))
+        XCTAssertTrue(auth.ssoSignInActive, "A WorkOS-to-Google hop keeps the SSO signal")
+        decide(auth, login, makeMainFrameAction("https://claude.ai/sso-callback"))
+        XCTAssertFalse(auth.ssoSignInActive)
+    }
+
+    @MainActor
     func testAllowsOAuthPopup_schemeBeforeHost() {
         let auth = makeAuthManager()
         // about: bootstraps have no host and must be allowed BEFORE any host check (pattern #7).
