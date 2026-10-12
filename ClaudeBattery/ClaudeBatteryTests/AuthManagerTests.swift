@@ -4064,8 +4064,13 @@ final class AuthManagerTests: XCTestCase {
     @MainActor
     func testEmailCodeAlert_copyNamesSingleSignOn() {
         let copy = AuthManager.makeEmailCodeAlert().informativeText
-        XCTAssertTrue(copy.contains("single sign-on"),
-                      "The email-code sheet must list single sign-on beside Google and passkey as unavailable: \(copy)")
+        // Issue #49: SSO can now finish in the window for Microsoft Entra companies, and email
+        // sign-in is switched off where a company requires SSO, so SSO users are sent to SSO.
+        XCTAssertTrue(copy.contains("If your company uses single sign-on (SSO), choose SSO"),
+                      "The email-code sheet must send SSO users to SSO, not to email sign-in: \(copy)")
+        XCTAssertFalse(copy.contains("single sign-on (SSO) sign-in aren't available"),
+                       "SSO is no longer listed as unavailable in the window")
+        XCTAssertTrue(copy.contains("Google and passkey sign-in aren't available"))
     }
 
     @MainActor

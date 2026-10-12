@@ -419,7 +419,7 @@ class AuthManager: NSObject, ObservableObject {
     static func makeEmailCodeAlert() -> NSAlert {
         let alert = NSAlert()
         alert.messageText = "Sign in with an email code"
-        alert.informativeText = "To sign in, choose \"Continue with email\" and enter the code Claude sends you. Google, passkey and single sign-on (SSO) sign-in aren't available in this sign-in window. If you get stuck, you can sign in manually under Settings."
+        alert.informativeText = "To sign in, choose \"Continue with email\" and enter the code Claude sends you. If your company uses single sign-on (SSO), choose SSO on the sign-in page instead. Google and passkey sign-in aren't available in this sign-in window. If you get stuck, you can sign in manually under Settings."
         alert.alertStyle = .informational
         alert.addButton(withTitle: "Ok, I'll login with email code")
         return alert
