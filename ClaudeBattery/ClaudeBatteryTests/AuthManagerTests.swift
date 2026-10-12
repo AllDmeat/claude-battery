@@ -929,12 +929,12 @@ final class AuthManagerTests: XCTestCase {
         let auth = makeAuthManager()
         auth.loginWebView = makeLoginWebView()
         auth.loginState = .error("boom")
-        var manualRequested = false
-        auth.onManualSignInRequested = { manualRequested = true }
+        var manualRequested: ManualSignInReason?
+        auth.onManualSignInRequested = { manualRequested = $0 }
 
         auth.overlayManualTapped()
 
-        XCTAssertTrue(manualRequested, "\"Sign in manually\" must invoke the hook that opens Settings")
+        XCTAssertEqual(manualRequested, .general, "\"Sign in manually\" must invoke the hook that opens Settings")
         XCTAssertEqual(auth.loginState, .idle)
         XCTAssertEqual(auth.loginOverlayKind, .none, "Overlay torn down")
     }
@@ -3882,6 +3882,33 @@ final class AuthManagerTests: XCTestCase {
         XCTAssertTrue(SettingsCopy.cookieHeaderHelp.contains("never into a web page"))
         XCTAssertFalse(SettingsCopy.diagnosticsCaption.contains("\u{2014}"))
         XCTAssertFalse(SettingsCopy.cookieHeaderHelp.contains("\u{2014}"))
+    }
+
+    // MARK: - Guided manual sign-in (issue #49)
+
+    @MainActor
+    func testManualSignInGuide_ssoRequestIsTakenOnce_generalRequestLeavesNothing() {
+        let guide = ManualSignInGuide()
+        XCTAssertFalse(guide.takePendingSSORequest())
+
+        guide.request(.general)
+        XCTAssertFalse(guide.takePendingSSORequest(),
+                       "A plain request keeps today's behavior: Settings only comes to the front")
+
+        guide.request(.singleSignOn)
+        XCTAssertTrue(guide.takePendingSSORequest(), "An SSO request guides Settings to the manual sign-in field")
+        XCTAssertFalse(guide.takePendingSSORequest(), "Taken once, so opening Settings later does not guide again")
+    }
+
+    @MainActor
+    func testSettingsCopy_ssoStepsStartWithSSOInTheBrowserAndKeepThePasteWarning() {
+        let steps = SettingsCopy.ssoCookieHeaderHelp
+        XCTAssertTrue(steps.hasPrefix("1. "), "Numbered steps")
+        XCTAssertTrue(steps.contains("single sign-on"), "Step 1 has the user sign in with SSO in a browser")
+        XCTAssertTrue(steps.contains("never into a web page"), "The paste warning stays")
+        XCTAssertFalse(steps.contains("Continue with email"))
+        XCTAssertFalse(SettingsCopy.ssoManualSignInIntro.contains("\u{2014}"))
+        XCTAssertFalse(steps.contains("\u{2014}"))
     }
 
     @MainActor

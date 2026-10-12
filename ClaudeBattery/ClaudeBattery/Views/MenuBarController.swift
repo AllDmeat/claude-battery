@@ -23,6 +23,8 @@ class MenuBarController: NSObject {
     private let usageService: UsageService
     private let updateChecker: UpdateChecker
     private var settingsWindowController: NSWindowController?
+    /// Carries a guided manual sign-in request into the Settings window (issue #49).
+    private let manualSignInGuide = ManualSignInGuide()
     private var appearanceObservation: NSKeyValueObservation?
     private var iconStyleObservation: NSKeyValueObservation?
     private var showSessionCountdownObservation: NSKeyValueObservation?
@@ -291,9 +293,16 @@ class MenuBarController: NSObject {
         }
     }
 
-    /// Open (or focus) the Settings window. Internal + `@objc` so it serves BOTH the menu-item
-    /// selector and the manual-sign-in hook that routes a stuck user from the login error overlay
-    /// to the paste section (U5) — no thin passthrough wrapper.
+    /// Open (or focus) Settings for a manual sign-in request from the sign-in window. An SSO
+    /// request also guides Settings to the paste field (issue #49).
+    func showManualSignIn(for reason: ManualSignInReason) {
+        manualSignInGuide.request(reason)
+        showSettings()
+    }
+
+    /// Open (or focus) the Settings window. Internal + `@objc` so it serves both the menu-item
+    /// selector and `showManualSignIn(for:)`, which routes a stuck user from the login error overlay
+    /// to the paste section (U5).
     @objc func showSettings() {
         if let wc = settingsWindowController {
             wc.window?.makeKeyAndOrderFront(nil)
@@ -304,6 +313,7 @@ class MenuBarController: NSObject {
         let settingsView = SettingsView(
             accountStore: accountStore,
             authManager: authManager,
+            manualSignInGuide: manualSignInGuide,
             closeWindow: { [weak self] in
                 self?.settingsWindowController?.close()
             }

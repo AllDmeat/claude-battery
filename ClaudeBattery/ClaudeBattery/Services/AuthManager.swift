@@ -27,6 +27,15 @@ enum LoginOverlayKind: Equatable {
     case error
 }
 
+/// Why the sign-in window sent the user to manual sign-in in Settings (issue #49).
+enum ManualSignInReason: Equatable {
+    /// Settings comes to the front and nothing else changes.
+    case general
+    /// A single sign-on (SSO) sign-in could not finish in the window. Settings scrolls to the
+    /// manual sign-in section, opens its help with SSO steps, and focuses the paste field.
+    case singleSignOn
+}
+
 /// Outcome of the manual paste sign-in (U5). Drives the Settings UI's inline status.
 enum ManualSignInResult: Equatable {
     /// Account added/reactivated. Carries its display name and how many ALREADY-STORED entries
@@ -122,8 +131,9 @@ class AuthManager: NSObject, ObservableObject {
     private(set) var ssoSignInActive = false
     var onAuthSuccess: (() -> Void)?
     /// Hook the app wires to open Settings at the manual paste section (U5). Invoked by the
-    /// sign-in error overlay's "Sign in manually" button so a stuck user reaches the floor.
-    var onManualSignInRequested: (() -> Void)?
+    /// sign-in error overlay's "Sign in manually" button so a stuck user reaches the floor. The
+    /// reason says whether Settings guides the user to the paste field (issue #49).
+    var onManualSignInRequested: ((ManualSignInReason) -> Void)?
     /// Hook the app wires to show the one-line repair confirmation after a WebView sign-in (R6,
     /// issue #41). The manual paste path returns its confirmation in `ManualSignInResult` and
     /// Settings prints it inline; the WebView path returns nothing and closes its window on success,
@@ -665,7 +675,7 @@ class AuthManager: NSObject, ObservableObject {
 
     // internal for @testable access in AuthManagerTests (error-overlay affordance tests)
     @objc func overlayManualTapped() {
-        onManualSignInRequested?()
+        onManualSignInRequested?(.general)
         loginState = .idle
         stopLoginWindow()
     }
