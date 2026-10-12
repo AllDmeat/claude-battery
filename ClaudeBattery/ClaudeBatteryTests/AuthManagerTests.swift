@@ -849,6 +849,16 @@ final class AuthManagerTests: XCTestCase {
     }
 
     @MainActor
+    func testIsClaudeHost_apexAndSubdomainsOnly() {
+        for host in ["claude.ai", "www.claude.ai", "a.b.claude.ai"] {
+            XCTAssertTrue(AuthManager.isClaudeHost(host), "\(host) should match")
+        }
+        for host in ["evil-claude.ai", "claude.ai.evil.com", "notclaude.ai", "claude.aix"] {
+            XCTAssertFalse(AuthManager.isClaudeHost(host), "\(host) must not match")
+        }
+    }
+
+    @MainActor
     func testDecidePolicy_ssoHosts_allowedInWindowButNeverAsNewWindows() {
         let auth = makeAuthManager()
         let login = makeLoginWebView()
@@ -3644,10 +3654,12 @@ final class AuthManagerTests: XCTestCase {
         XCTAssertEqual(login.subviews.filter { $0.identifier == AuthManager.loginOverlayIdentifier }.count, 1,
                        "The overlay is built once, not once per retried hop")
 
-        // A different host is a new bounce and is recorded again.
-        decide(auth, login, makeMainFrameAction("https://login.microsoftonline.com/common/oauth2"))
-        XCTAssertEqual(records(kind: "nav-decision", from: diagnostics).map { $0["host"] as? String },
-                       ["acme.okta.com", "login.microsoftonline.com"])
+        // A different blocked host is a new bounce and is recorded again. (Microsoft sign-in hosts
+        // are allowed since issue #49, so this hop uses a company host that is still blocked.)
+        decide(auth, login, makeMainFrameAction("https://adfs.example.com/adfs/ls"))
+        let decisions = records(kind: "nav-decision", from: diagnostics)
+        XCTAssertEqual(decisions.map { $0["host"] as? String }, ["acme.okta.com", "adfs.example.com"])
+        XCTAssertEqual(decisions.map { $0["decision"] as? String }, ["block", "block"])
     }
 
     @MainActor

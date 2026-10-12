@@ -2011,6 +2011,13 @@ class AuthManager: NSObject, ObservableObject {
         "account.activedirectory.windowsazure.com"
     ]
 
+    /// claude.ai itself or one of its subdomains: the apex with `==` and subdomains with a
+    /// leading-dot `hasSuffix` (pattern #2), so `evil-claude.ai` does not match. Shared by the
+    /// session-cookie pin and the SSO-active reset so the two cannot drift apart.
+    static func isClaudeHost(_ host: String) -> Bool {
+        host == "claude.ai" || host.hasSuffix(".claude.ai")
+    }
+
     /// Whether `host` is one of `ssoNavigationHosts`. Consulted for main-frame and subframe
     /// navigation in the login window only, never for popups: a popup covers the whole login view
     /// with no close control, so `allowsOAuthPopup` keeps `isAllowedDomain` alone.
@@ -2175,7 +2182,7 @@ extension AuthManager: WKNavigationDelegate {
             if isMainFrame && !onPopup {
                 if isSSOHost {
                     ssoSignInActive = true
-                } else if host == "claude.ai" || host.hasSuffix(".claude.ai") {
+                } else if Self.isClaudeHost(host) {
                     ssoSignInActive = false
                 }
                 lastAllowedMainFrameHost = host
@@ -2237,7 +2244,7 @@ extension AuthManager: WKNavigationDelegate {
               // party (accounts.google.com, *.gstatic.com, …) deliver a
               // `Set-Cookie: sessionKey=…; Domain=.claude.ai` that Foundation's parser honors —
               // a session-fixation vector (critical pattern #2). Pin to claude.ai.
-              host == "claude.ai" || host.hasSuffix(".claude.ai") else { return }
+              Self.isClaudeHost(host) else { return }
 
         captureSessionCookie(from: Self.sessionCookies(fromResponseHeaders: httpResponse.allHeaderFields, url: url))
     }
