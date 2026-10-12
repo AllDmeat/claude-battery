@@ -3945,6 +3945,66 @@ final class AuthManagerTests: XCTestCase {
         XCTAssertNil(auth.loginWebView, "The sign-in window is torn down")
     }
 
+    // MARK: - Manual sign-in link (issue #49)
+
+    @MainActor
+    func testManualSignInLinkAccessory_trailingLinkStartsHidden() {
+        let auth = makeAuthManager()
+        let accessory = AuthManager.makeManualSignInLinkAccessory(target: auth)
+
+        XCTAssertEqual(accessory.layoutAttribute, .trailing)
+        XCTAssertTrue(accessory.isHidden)
+        let button = accessory.view.subviews.compactMap { $0 as? NSButton }.first
+        XCTAssertEqual(button?.title, "Sign in manually instead")
+        XCTAssertEqual(button?.action, #selector(AuthManager.manualSignInLinkTapped))
+    }
+
+    @MainActor
+    func testManualSignInLink_showsOnlyOnWorkOSOrMicrosoftPagesWhileIdle() {
+        let auth = makeAuthManager()
+        let login = makeLoginWebView()
+        auth.loginWebView = login
+        let accessory = AuthManager.makeManualSignInLinkAccessory(target: auth)
+        auth.manualSignInLinkAccessory = accessory
+
+        decide(auth, login, makeMainFrameAction("https://claude.ai/login"))
+        XCTAssertTrue(accessory.isHidden, "Hidden on claude.ai")
+
+        decide(auth, login, makeMainFrameAction("https://login.microsoftonline.com/t/oauth2/authorize"))
+        XCTAssertFalse(accessory.isHidden, "Visible on a Microsoft sign-in page")
+
+        auth.loginState = .signingIn
+        XCTAssertTrue(accessory.isHidden, "Hidden while sign-in is finishing")
+        auth.loginState = .idle
+        XCTAssertFalse(accessory.isHidden)
+        auth.loginState = .error("boom")
+        XCTAssertTrue(accessory.isHidden, "Hidden under the error card")
+        auth.loginState = .idle
+
+        decide(auth, login, makeMainFrameAction("https://accounts.google.com/o/saml2"))
+        XCTAssertTrue(accessory.isHidden, "Hidden on a page that is not WorkOS or Microsoft")
+        decide(auth, login, makeMainFrameAction("https://api.workos.com/sso/authorize"))
+        XCTAssertFalse(accessory.isHidden, "Visible on a WorkOS page")
+        decide(auth, login, makeSubframeAction("https://claude.ai/frame"))
+        XCTAssertFalse(accessory.isHidden, "A subframe does not change the page the window shows")
+
+        decide(auth, login, makeMainFrameAction("https://claude.ai/sso-callback"))
+        XCTAssertTrue(accessory.isHidden, "Hidden once the sign-in is back on claude.ai")
+    }
+
+    @MainActor
+    func testManualSignInLinkTapped_closesWindowAndRequestsGuidedManualSignIn() {
+        let auth = makeAuthManager()
+        auth.loginWebView = makeLoginWebView()
+        var requested: ManualSignInReason?
+        auth.onManualSignInRequested = { requested = $0 }
+
+        auth.manualSignInLinkTapped()
+
+        XCTAssertEqual(requested, .singleSignOn)
+        XCTAssertNil(auth.loginWebView, "The sign-in window is torn down")
+    }
+
     @MainActor
     func testSSOCardCopy_namesManualSignInAndNeverContinueWithEmail() {
         for copy in [AuthManager.ssoCardTitle, AuthManager.ssoCardMessage, AuthManager.ssoBlockedMessage] {

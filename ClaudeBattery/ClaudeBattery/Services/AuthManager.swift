@@ -65,7 +65,10 @@ enum ManualSignInResult: Equatable {
 @MainActor
 class AuthManager: NSObject, ObservableObject {
     @Published var loginState: LoginState = .idle {
-        didSet { updateLoginOverlay(for: loginState) }
+        didSet {
+            updateLoginOverlay(for: loginState)
+            updateManualSignInLink()
+        }
     }
 
     private let storage: StorageService
@@ -129,6 +132,13 @@ class AuthManager: NSObject, ObservableObject {
     /// redirect never commits, so the URL still reads claude.ai.
     // internal for @testable access in AuthManagerTests
     private(set) var ssoSignInActive = false
+    /// Host of the last main-frame navigation the login window allowed: the page it shows, for
+    /// the manual sign-in link (issue #49). Cleared with `ssoSignInActive`.
+    private var lastAllowedMainFrameHost: String?
+    /// The "Sign in manually instead" link in the sign-in window's title bar (issue #49). Outside
+    /// the web view, so it survives the overlay and popups.
+    // internal for @testable access in AuthManagerTests (presentLogin builds a real window)
+    var manualSignInLinkAccessory: NSTitlebarAccessoryViewController?
     var onAuthSuccess: (() -> Void)?
     /// Hook the app wires to open Settings at the manual paste section (U5). Invoked by the
     /// sign-in error overlay's "Sign in manually" button so a stuck user reaches the floor. The
@@ -352,6 +362,9 @@ class AuthManager: NSObject, ObservableObject {
         window.level = .floating
         window.center()
         window.delegate = self
+        let linkAccessory = Self.makeManualSignInLinkAccessory(target: self)
+        window.addTitlebarAccessoryViewController(linkAccessory)
+        manualSignInLinkAccessory = linkAccessory
 
         let controller = NSWindowController(window: window)
         self.loginWindowController = controller
@@ -514,6 +527,8 @@ class AuthManager: NSObject, ObservableObject {
         lastBlockedNavigation = nil
         lastNavFailure = nil
         ssoSignInActive = false
+        lastAllowedMainFrameHost = nil
+        manualSignInLinkAccessory = nil
         popupWebView?.stopLoading()
         popupWebView?.removeFromSuperview()
         popupWebView = nil
@@ -691,6 +706,47 @@ class AuthManager: NSObject, ObservableObject {
         requestManualSignIn(.singleSignOn)
     }
 
+    /// The title-bar link: the same close-and-route as the SSO card's "Sign in manually".
+    // internal for @testable access in AuthManagerTests
+    @objc func manualSignInLinkTapped() {
+        requestManualSignIn(.singleSignOn)
+    }
+
+    /// "Sign in manually instead", a borderless link on the trailing side of the sign-in window's
+    /// title bar. Starts hidden; `updateManualSignInLink` shows it.
+    static func makeManualSignInLinkAccessory(target: AuthManager) -> NSTitlebarAccessoryViewController {
+        let button = NSButton(title: "Sign in manually instead", target: target,
+                              action: #selector(manualSignInLinkTapped))
+        button.isBordered = false
+        button.font = .preferredFont(forTextStyle: .callout)
+        button.attributedTitle = NSAttributedString(string: button.title, attributes: [
+            .foregroundColor: NSColor.linkColor,
+            .font: button.font ?? NSFont.preferredFont(forTextStyle: .callout)
+        ])
+        button.translatesAutoresizingMaskIntoConstraints = false
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: button.intrinsicContentSize.width + 16, height: 28))
+        container.addSubview(button)
+        NSLayoutConstraint.activate([
+            button.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
+            button.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+        ])
+
+        let accessory = NSTitlebarAccessoryViewController()
+        accessory.layoutAttribute = .trailing
+        accessory.view = container
+        accessory.isHidden = true
+        return accessory
+    }
+
+    /// Show the title-bar link only while an SSO sign-in is on a WorkOS or Microsoft page and
+    /// the sign-in is idle: never over "Finishing sign-in" or the error card, which has its own
+    /// "Sign in manually".
+    private func updateManualSignInLink() {
+        let onSSOPage = lastAllowedMainFrameHost.map(Self.isSSONavigationHost) ?? false
+        manualSignInLinkAccessory?.isHidden = !(ssoSignInActive && onSSOPage && loginState == .idle)
+    }
+
     private func requestManualSignIn(_ reason: ManualSignInReason) {
         onManualSignInRequested?(reason)
         loginState = .idle
@@ -710,6 +766,8 @@ class AuthManager: NSObject, ObservableObject {
         lastBlockedNavigation = nil
         lastNavFailure = nil
         ssoSignInActive = false
+        lastAllowedMainFrameHost = nil
+        updateManualSignInLink()
     }
 
     /// Reset capture state and reload claude.ai/login in the existing login WebView.
@@ -2122,6 +2180,8 @@ extension AuthManager: WKNavigationDelegate {
                 } else if host == "claude.ai" || host.hasSuffix(".claude.ai") {
                     ssoSignInActive = false
                 }
+                lastAllowedMainFrameHost = host
+                updateManualSignInLink()
             }
             // U6 diagnostics: decision + host only (never url.absoluteString — it may carry
             // query params). Written to the exported diag-*.jsonl through the same injected
