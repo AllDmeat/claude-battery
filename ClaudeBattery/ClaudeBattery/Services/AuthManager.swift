@@ -563,7 +563,9 @@ class AuthManager: NSObject, ObservableObject {
     // internal for @testable access in AuthManagerTests
     func showLoginOverlayError(_ message: String) {
         guard let host = loginWebView else { return }
-        attachOverlay(makeErrorOverlay(message: message), to: host)
+        // The SSO card is chosen by its message, a static literal, so the login state stays the
+        // one source of truth for which card is up.
+        attachOverlay(makeErrorOverlay(message: message, singleSignOn: message == Self.ssoCardMessage), to: host)
         loginOverlayKind = .error
     }
 
@@ -623,7 +625,9 @@ class AuthManager: NSObject, ObservableObject {
 
     /// The recoverable error overlay shown when org discovery fails: a message plus
     /// "Try again" (reload the login flow) and "Sign in manually" (jump to the paste floor).
-    private func makeErrorOverlay(message: String) -> NSView {
+    /// The SSO card (issue #49) has its own title and makes guided manual sign-in the default,
+    /// because trying again reaches the same blocked company sign-in page.
+    private func makeErrorOverlay(message: String, singleSignOn: Bool) -> NSView {
         let container = NSVisualEffectView()
         container.identifier = Self.loginOverlayIdentifier
         container.material = .hudWindow
@@ -633,7 +637,7 @@ class AuthManager: NSObject, ObservableObject {
         container.setAccessibilityRole(.group)
         container.setAccessibilityLabel("Sign-in problem")
 
-        let title = NSTextField(labelWithString: "Couldn’t finish sign-in")
+        let title = NSTextField(labelWithString: singleSignOn ? Self.ssoCardTitle : "Couldn’t finish sign-in")
         title.font = .preferredFont(forTextStyle: .title3) // scales with Dynamic Type (was fixed 15pt)
         title.alignment = .center
 
@@ -645,12 +649,14 @@ class AuthManager: NSObject, ObservableObject {
 
         let retry = NSButton(title: "Try again", target: self, action: #selector(overlayRetryTapped))
         retry.bezelStyle = .rounded
-        retry.keyEquivalent = "\r"
 
-        let manual = NSButton(title: "Sign in manually", target: self, action: #selector(overlayManualTapped))
+        let manual = NSButton(title: "Sign in manually", target: self,
+                              action: singleSignOn ? #selector(overlaySSOManualTapped) : #selector(overlayManualTapped))
         manual.bezelStyle = .rounded
 
-        let buttons = NSStackView(views: [retry, manual])
+        let defaultButton = singleSignOn ? manual : retry
+        defaultButton.keyEquivalent = "\r"
+        let buttons = NSStackView(views: singleSignOn ? [manual, retry] : [retry, manual])
         buttons.orientation = .horizontal
         buttons.spacing = 12
 
@@ -675,7 +681,18 @@ class AuthManager: NSObject, ObservableObject {
 
     // internal for @testable access in AuthManagerTests (error-overlay affordance tests)
     @objc func overlayManualTapped() {
-        onManualSignInRequested?(.general)
+        requestManualSignIn(.general)
+    }
+
+    /// The SSO card's "Sign in manually" (issue #49): the same close-and-route, with Settings
+    /// guiding the user to the paste field.
+    // internal for @testable access in AuthManagerTests
+    @objc func overlaySSOManualTapped() {
+        requestManualSignIn(.singleSignOn)
+    }
+
+    private func requestManualSignIn(_ reason: ManualSignInReason) {
+        onManualSignInRequested?(reason)
         loginState = .idle
         stopLoginWindow()
     }
@@ -1973,10 +1990,17 @@ class AuthManager: NSObject, ObservableObject {
         case subframe
     }
 
-    /// The error copy for a blocked single sign-on hop. A compile-time literal that never
-    /// interpolates the host: the blocked host is a company identity provider, and it belongs in
-    /// the opt-in diagnostics record, not in the `login-state` line every error emits.
-    static let ssoBlockedMessage = "This sign-in window can't complete single sign-on (SSO). Choose \"Continue with email\" and enter the code Claude sends you, or use Sign in manually to paste your cookie header under Settings."
+    /// The error copy for a blocked hop outside a known SSO hand-off. It still names single
+    /// sign-on, because an unlisted company sign-in host is the likeliest cause. A compile-time
+    /// literal that never interpolates the host: the blocked host is a company identity provider,
+    /// and it belongs in the opt-in diagnostics record, not in the `login-state` line every error
+    /// emits.
+    static let ssoBlockedMessage = "This sign-in window can't open that page. If your company uses single sign-on (SSO), choose Sign in manually to copy your session from your browser into Settings."
+
+    /// The SSO card's copy (issue #49), for a block after the sign-in reached WorkOS or Microsoft.
+    /// Static literals for the same reason as `ssoBlockedMessage`.
+    static let ssoCardTitle = "Your company's sign-in can't open here"
+    static let ssoCardMessage = "This window can't show your company's single sign-on (SSO) page. You can still sign in: choose Sign in manually to copy your session from Safari or Chrome into Settings."
 
     /// Classify a blocked navigation from what the delegate can see. Pure and static so the table
     /// is unit-testable without a WebKit frame. A nil target frame is a new window: a link click
@@ -2038,7 +2062,7 @@ class AuthManager: NSObject, ObservableObject {
         }
 
         guard loginState == .idle, !hasCapturedSession else { return }
-        loginState = .error(Self.ssoBlockedMessage)
+        loginState = .error(kind == .main && ssoSignInActive ? Self.ssoCardMessage : Self.ssoBlockedMessage)
     }
 
     /// Fully retire the mounted popup: clear its delegate pointers and nil our reference, so a

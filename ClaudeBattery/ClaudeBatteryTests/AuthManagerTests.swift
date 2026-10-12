@@ -211,6 +211,14 @@ final class AuthManagerTests: XCTestCase {
         webView.subviews.contains { $0.identifier == AuthManager.loginOverlayIdentifier }
     }
 
+    /// Every view inside the mounted overlay, depth first, so a test can read the card's text and
+    /// buttons.
+    @MainActor
+    private func overlayViews(_ webView: WKWebView) -> [NSView] {
+        func flatten(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(flatten) }
+        return webView.subviews.filter { $0.identifier == AuthManager.loginOverlayIdentifier }.flatMap(flatten)
+    }
+
     @MainActor
     func testOverlay_shownOnSigningIn() {
         let auth = makeAuthManager()
@@ -3862,6 +3870,88 @@ final class AuthManagerTests: XCTestCase {
         auth.webView(login, didFailProvisionalNavigation: nil, withError: cancelled)
         XCTAssertEqual(records(kind: "nav-failed", from: diagnostics).count, 3)
         XCTAssertEqual(auth.loginState, .idle, "nav-failed never touches the login state")
+    }
+
+    // MARK: - SSO card (issue #49)
+
+    @MainActor
+    func testDecidePolicy_mainBlockDuringSSO_showsSSOCardLeadingToGuidedManualSignIn() {
+        let auth = makeAuthManager()
+        let login = makeLoginWebView()
+        auth.loginWebView = login
+        let diagnostics = makeDiagnostics()
+        auth.diagnostics = diagnostics
+
+        decide(auth, login, makeMainFrameAction("https://api.workos.com/sso/authorize"))
+        XCTAssertEqual(decide(auth, login, makeMainFrameAction("https://adfs.example.com/adfs/ls")), .cancel)
+
+        XCTAssertEqual(auth.loginState, .error(AuthManager.ssoCardMessage))
+        XCTAssertEqual(auth.loginOverlayKind, .error)
+        let views = overlayViews(login)
+        let labels = views.compactMap { ($0 as? NSTextField)?.stringValue }
+        XCTAssertTrue(labels.contains(AuthManager.ssoCardTitle), "The SSO card has its own title")
+        XCTAssertFalse(labels.contains("Couldn\u{2019}t finish sign-in"))
+        let buttons = views.compactMap { $0 as? NSButton }
+        XCTAssertEqual(buttons.first { $0.keyEquivalent == "\r" }?.title, "Sign in manually",
+                       "Manual sign-in is the default action on the SSO card")
+        XCTAssertTrue(buttons.contains { $0.title == "Try again" })
+
+        let blocked = records(kind: "nav-decision", from: diagnostics).filter { $0["decision"] as? String == "block" }
+        XCTAssertEqual(blocked.first?["host"] as? String, "adfs.example.com", "The blocked company host is recorded")
+    }
+
+    @MainActor
+    func testDecidePolicy_mainBlockOutsideSSO_keepsTheGeneralCard() {
+        let auth = makeAuthManager()
+        let login = makeLoginWebView()
+        auth.loginWebView = login
+
+        decide(auth, login, makeMainFrameAction("https://acme.okta.com/app/sso"))
+
+        XCTAssertEqual(auth.loginState, .error(AuthManager.ssoBlockedMessage))
+        let views = overlayViews(login)
+        XCTAssertTrue(views.compactMap { ($0 as? NSTextField)?.stringValue }.contains("Couldn\u{2019}t finish sign-in"))
+        XCTAssertEqual(views.compactMap { $0 as? NSButton }.first { $0.keyEquivalent == "\r" }?.title, "Try again")
+    }
+
+    @MainActor
+    func testDecidePolicy_subframeBlockDuringSSO_recordsWithoutACard() {
+        let auth = makeAuthManager()
+        let login = makeLoginWebView()
+        auth.loginWebView = login
+        let diagnostics = makeDiagnostics()
+        auth.diagnostics = diagnostics
+
+        decide(auth, login, makeMainFrameAction("https://login.microsoftonline.com/t/oauth2/authorize"))
+        XCTAssertEqual(decide(auth, login, makeSubframeAction("https://tracker.example/pixel")), .cancel)
+
+        XCTAssertEqual(auth.loginState, .idle)
+        XCTAssertEqual(auth.loginOverlayKind, .none)
+        XCTAssertEqual(records(kind: "nav-decision", from: diagnostics).last?["kind"] as? String, "subframe")
+    }
+
+    @MainActor
+    func testSSOCardManualTapped_closesWindowAndRequestsGuidedManualSignIn() {
+        let auth = makeAuthManager()
+        auth.loginWebView = makeLoginWebView()
+        auth.loginState = .error(AuthManager.ssoCardMessage)
+        var requested: ManualSignInReason?
+        auth.onManualSignInRequested = { requested = $0 }
+
+        auth.overlaySSOManualTapped()
+
+        XCTAssertEqual(requested, .singleSignOn)
+        XCTAssertEqual(auth.loginState, .idle)
+        XCTAssertNil(auth.loginWebView, "The sign-in window is torn down")
+    }
+
+    @MainActor
+    func testSSOCardCopy_namesManualSignInAndNeverContinueWithEmail() {
+        for copy in [AuthManager.ssoCardTitle, AuthManager.ssoCardMessage, AuthManager.ssoBlockedMessage] {
+            XCTAssertFalse(copy.contains("Continue with email"), "SSO users are not sent to email sign-in: \(copy)")
+            XCTAssertFalse(copy.contains("\u{2014}"), "No em dashes in user-facing copy")
+        }
+        XCTAssertTrue(AuthManager.ssoCardMessage.contains("Sign in manually"))
     }
 
     @MainActor
