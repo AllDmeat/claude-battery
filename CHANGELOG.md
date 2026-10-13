@@ -1,5 +1,17 @@
 # Change Log
 
+### v1.74 beta
+
+**Sign-in with single sign-on (SSO)**
+- "Sign in with SSO" can now finish inside the sign-in window for companies that use Microsoft Entra ID. The window used to block claude.ai's hand-off to WorkOS before the company's Microsoft page could load (issue #49). It now allows an exact list of WorkOS and Microsoft sign-in hosts, in the window itself only, never in popups. No wildcard host was added.
+- When a company's sign-in page still can't open in the window, such as an ADFS or Okta server, a card now says so and makes "Sign in manually" its default button. Trying again would only reach the same blocked page.
+- While a WorkOS or Microsoft page is showing, a "Sign in manually instead" link sits in the window's title bar. It covers companies that refuse sign-in from an app window, for example when they require a managed device.
+- Manual sign-in from the SSO card or the link opens Settings at the manual sign-in field, with steps for copying your session from a browser where you signed in with SSO.
+- No sign-in message tells SSO users to choose "Continue with email" any more. Companies that require SSO switch email sign-in off, so that advice was a dead end.
+
+**Diagnostics**
+- Exports now record the host of every page the sign-in window allowed, checked the same way as blocked hosts, so an export shows which sign-in step was reached.
+
 ### v1.73
 
 **Session and Weekly Dials**
