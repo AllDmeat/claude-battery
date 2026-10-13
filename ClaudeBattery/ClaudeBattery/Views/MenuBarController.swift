@@ -683,6 +683,7 @@ extension MenuBarController: NSPopoverDelegate {
         PopoverBodyCounters.reset()
         #endif
         popoverClock.start()
+        usageService.retryIfFailing()
     }
 
     func popoverDidClose(_ notification: Notification) {

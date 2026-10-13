@@ -519,6 +519,34 @@ public class UsageServiceTests
     }
 
     [Fact]
+    public async Task RegionUnavailable_BacksOff_NeverSignsOut()
+    {
+        // A dropped VPN answers 403 region_unavailable: back off and keep the stale snapshot, never
+        // the auth-failed surface, and recover on the next success.
+        var clock = new FakeClock();
+        var net = new FakeNetwork { IsAvailable = true };
+        var api = new FakeApi();
+
+        using var service = new UsageService(api, net, clock, transportUaIsFallback: () => true);
+        service.StartPolling(Org);
+
+        await service.PollUsageAsync(CancellationToken.None); // success: snapshot published
+        api.UsageBehavior = _ => throw new ClaudeAuthException(403, looksLikeCloudflareBlock: false, isRegionUnavailable: true);
+        for (var i = 0; i < 4; i++)
+        {
+            await service.PollUsageAsync(CancellationToken.None);
+        }
+
+        Assert.False(service.AuthFailed); // no escalation, even with the fallback-UA signal wired
+        Assert.NotNull(service.LatestUsage);
+        Assert.True(service.ConsecutiveFailures > 0);
+
+        api.UsageBehavior = null; // VPN back
+        await service.PollUsageAsync(CancellationToken.None);
+        Assert.Equal(0, service.ConsecutiveFailures);
+    }
+
+    [Fact]
     public async Task AuthFailure_On403_SameAs401()
     {
         var clock = new FakeClock();

@@ -306,11 +306,13 @@ public sealed class ClaudeApi : IClaudeApi, IDisposable
         {
             if (throwOnAuth)
             {
-                // Read the Cloudflare-block tell from response HEADERS before disposal (never the
-                // body - this throw precedes the only body read at ReadAsByteArrayAsync below, and
-                // pulling body material into scope would defeat the redaction gate). U4 decides what
-                // to do with the flag.
-                throw new ClaudeAuthException(status, LooksLikeCloudflareBlock(status, response));
+                // The Cloudflare-block tell comes from response HEADERS only. The one body read on
+                // this path is IsRegionUnavailableAsync, which reduces a small JSON 403 to a bool and
+                // drops the bytes, so no body material reaches the exception (redaction gate). U4
+                // decides what to do with both flags.
+                var regionUnavailable = status == 403
+                    && await IsRegionUnavailableAsync(response, timeoutToken).ConfigureAwait(false);
+                throw new ClaudeAuthException(status, LooksLikeCloudflareBlock(status, response), regionUnavailable);
             }
 
             return null;
@@ -352,6 +354,47 @@ public sealed class ClaudeApi : IClaudeApi, IDisposable
         // ContentType reads the response HEADER, not the body (no ReadAsStringAsync/ByteArrayAsync).
         return status == 403
             && string.Equals(response.Content.Headers.ContentType?.MediaType, "text/html", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// True when a 403's JSON body is claude.ai's region refusal,
+    /// <c>{"error":{"details":{"error_code":"region_unavailable"}}}</c> (captured live from a Moscow IP
+    /// on 2026-10-06). An expired session is ALSO a JSON 403 (<c>account_session_invalid</c>), so the
+    /// headers cannot tell them apart and the body has to be read. Only the derived bool escapes this
+    /// method; the bytes are dropped here and never logged (redaction gate). Any read or parse failure
+    /// answers false, which keeps the pre-existing auth-failure behavior. Caller cancellation still
+    /// propagates.
+    /// </summary>
+    private static async Task<bool> IsRegionUnavailableAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        if (!string.Equals(response.Content.Headers.ContentType?.MediaType, "application/json", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        // The error body is a few hundred bytes; refuse anything that announces itself as large.
+        if (response.Content.Headers.ContentLength is > 64 * 1024)
+        {
+            return false;
+        }
+
+        try
+        {
+            var bytes = await response.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
+            using var doc = JsonDocument.Parse(bytes);
+            return doc.RootElement.ValueKind == JsonValueKind.Object
+                && doc.RootElement.TryGetProperty("error", out var error)
+                && error.ValueKind == JsonValueKind.Object
+                && error.TryGetProperty("details", out var details)
+                && details.ValueKind == JsonValueKind.Object
+                && details.TryGetProperty("error_code", out var code)
+                && code.ValueKind == JsonValueKind.String
+                && code.GetString() == "region_unavailable";
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return false;
+        }
     }
 
     /// <summary>
