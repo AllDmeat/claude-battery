@@ -529,6 +529,8 @@ public class UsageServiceTests
 
         using var service = new UsageService(api, net, clock, transportUaIsFallback: () => true);
         service.StartPolling(Org);
+        var authFired = false;
+        service.AuthFailureDetected += (_, _) => authFired = true;
 
         await service.PollUsageAsync(CancellationToken.None); // success: snapshot published
         api.UsageBehavior = _ => throw new ClaudeAuthException(403, looksLikeCloudflareBlock: false, isRegionUnavailable: true);
@@ -538,12 +540,46 @@ public class UsageServiceTests
         }
 
         Assert.False(service.AuthFailed); // no escalation, even with the fallback-UA signal wired
+        Assert.False(authFired);          // no "Sign In Again" prompt either
         Assert.NotNull(service.LatestUsage);
         Assert.True(service.ConsecutiveFailures > 0);
 
         api.UsageBehavior = null; // VPN back
         await service.PollUsageAsync(CancellationToken.None);
         Assert.Equal(0, service.ConsecutiveFailures);
+    }
+
+    [Fact]
+    public async Task FirstPollAfterResume_ToleratesRegionUnavailable_WithoutPenalty()
+    {
+        // A VPN still reconnecting after wake answers region_unavailable on the first poll; that
+        // poll gets the same one-shot grace as a transient online throw, and never signs out.
+        var clock = new FakeClock();
+        var net = new FakeNetwork { IsAvailable = true };
+        var api = new FakeApi { UsageBehavior = _ => throw new ClaudeAuthException(403, looksLikeCloudflareBlock: false, isRegionUnavailable: true) };
+
+        using var service = new UsageService(api, net, clock);
+        var authFired = false;
+        service.AuthFailureDetected += (_, _) => authFired = true;
+        service.SetOrganization(Org); // prime org without an immediate poll
+
+        // A new service starts with the grace armed, so spend it first; otherwise the resume
+        // below would not be what grants the grace.
+        await service.PollUsageAsync(CancellationToken.None);
+        await service.PollUsageAsync(CancellationToken.None);
+        Assert.Equal(1, service.ConsecutiveFailures);
+
+        service.HandleResume(); // marks the next poll as first-after-resume
+
+        await service.PollUsageAsync(CancellationToken.None);
+        Assert.Equal(1, service.ConsecutiveFailures); // first post-resume poll is penalty-free
+        Assert.False(service.AuthFailed);
+
+        // The next poll (no longer first-after-resume) backs off on the same refusal.
+        await service.PollUsageAsync(CancellationToken.None);
+        Assert.Equal(2, service.ConsecutiveFailures);
+        Assert.False(service.AuthFailed);
+        Assert.False(authFired); // no "Sign In Again" prompt
     }
 
     [Fact]
