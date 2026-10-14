@@ -27,6 +27,15 @@ enum LoginOverlayKind: Equatable {
     case error
 }
 
+/// Why the sign-in window sent the user to manual sign-in in Settings (issue #49).
+enum ManualSignInReason: Equatable {
+    /// Settings comes to the front and nothing else changes.
+    case general
+    /// A single sign-on (SSO) sign-in could not finish in the window. Settings scrolls to the
+    /// manual sign-in section, opens its help with SSO steps, and focuses the paste field.
+    case singleSignOn
+}
+
 /// Outcome of the manual paste sign-in (U5). Drives the Settings UI's inline status.
 enum ManualSignInResult: Equatable {
     /// Account added/reactivated. Carries its display name and how many ALREADY-STORED entries
@@ -56,7 +65,10 @@ enum ManualSignInResult: Equatable {
 @MainActor
 class AuthManager: NSObject, ObservableObject {
     @Published var loginState: LoginState = .idle {
-        didSet { updateLoginOverlay(for: loginState) }
+        didSet {
+            updateLoginOverlay(for: loginState)
+            updateManualSignInLink()
+        }
     }
 
     private let storage: StorageService
@@ -113,10 +125,25 @@ class AuthManager: NSObject, ObservableObject {
     /// blocked hop (the same `domain` and `code` every time) writes one `nav-failed` record
     /// instead of one per attempt. Cleared alongside `lastBlockedNavigation`.
     private var lastNavFailure: (domain: String, code: Int)?
+    /// Whether this attempt is inside a single sign-on (SSO) hand-off (issue #49). Set by an
+    /// allowed main-frame navigation to a WorkOS or Microsoft host, and cleared only by an allowed
+    /// main-frame claude.ai navigation, a retry, or teardown. Any other host leaves it alone, so a
+    /// WorkOS-to-Google hop keeps it. The web view's committed URL cannot stand in for it: a WorkOS
+    /// redirect never commits, so the URL still reads claude.ai.
+    // internal for @testable access in AuthManagerTests
+    private(set) var ssoSignInActive = false
+    /// Host of the last main-frame navigation the login window allowed: the page it shows, for
+    /// the manual sign-in link (issue #49). Cleared with `ssoSignInActive`.
+    private var lastAllowedMainFrameHost: String?
+    /// The "Sign in manually instead" link in the sign-in window's title bar (issue #49). Outside
+    /// the web view, so it survives the overlay and popups.
+    // internal for @testable access in AuthManagerTests (presentLogin builds a real window)
+    var manualSignInLinkAccessory: NSTitlebarAccessoryViewController?
     var onAuthSuccess: (() -> Void)?
     /// Hook the app wires to open Settings at the manual paste section (U5). Invoked by the
-    /// sign-in error overlay's "Sign in manually" button so a stuck user reaches the floor.
-    var onManualSignInRequested: (() -> Void)?
+    /// sign-in error overlay's "Sign in manually" button so a stuck user reaches the floor. The
+    /// reason says whether Settings guides the user to the paste field (issue #49).
+    var onManualSignInRequested: ((ManualSignInReason) -> Void)?
     /// Hook the app wires to show the one-line repair confirmation after a WebView sign-in (R6,
     /// issue #41). The manual paste path returns its confirmation in `ManualSignInResult` and
     /// Settings prints it inline; the WebView path returns nothing and closes its window on success,
@@ -335,6 +362,9 @@ class AuthManager: NSObject, ObservableObject {
         window.level = .floating
         window.center()
         window.delegate = self
+        let linkAccessory = Self.makeManualSignInLinkAccessory(target: self)
+        window.addTitlebarAccessoryViewController(linkAccessory)
+        manualSignInLinkAccessory = linkAccessory
 
         let controller = NSWindowController(window: window)
         self.loginWindowController = controller
@@ -389,7 +419,7 @@ class AuthManager: NSObject, ObservableObject {
     static func makeEmailCodeAlert() -> NSAlert {
         let alert = NSAlert()
         alert.messageText = "Sign in with an email code"
-        alert.informativeText = "To sign in, choose \"Continue with email\" and enter the code Claude sends you. Google, passkey and single sign-on (SSO) sign-in aren't available in this sign-in window. If you get stuck, you can sign in manually under Settings."
+        alert.informativeText = "To sign in, choose \"Continue with email\" and enter the code Claude sends you. If your company uses single sign-on (SSO), choose SSO on the sign-in page instead. Google and passkey sign-in aren't available in this sign-in window. If you get stuck, you can sign in manually under Settings."
         alert.alertStyle = .informational
         alert.addButton(withTitle: "Ok, I'll login with email code")
         return alert
@@ -496,6 +526,9 @@ class AuthManager: NSObject, ObservableObject {
         urlObservation = nil
         lastBlockedNavigation = nil
         lastNavFailure = nil
+        ssoSignInActive = false
+        lastAllowedMainFrameHost = nil
+        manualSignInLinkAccessory = nil
         popupWebView?.stopLoading()
         popupWebView?.removeFromSuperview()
         popupWebView = nil
@@ -545,7 +578,9 @@ class AuthManager: NSObject, ObservableObject {
     // internal for @testable access in AuthManagerTests
     func showLoginOverlayError(_ message: String) {
         guard let host = loginWebView else { return }
-        attachOverlay(makeErrorOverlay(message: message), to: host)
+        // The SSO card is chosen by its message, a static literal, so the login state stays the
+        // one source of truth for which card is up.
+        attachOverlay(makeErrorOverlay(message: message, singleSignOn: message == Self.ssoCardMessage), to: host)
         loginOverlayKind = .error
     }
 
@@ -605,7 +640,9 @@ class AuthManager: NSObject, ObservableObject {
 
     /// The recoverable error overlay shown when org discovery fails: a message plus
     /// "Try again" (reload the login flow) and "Sign in manually" (jump to the paste floor).
-    private func makeErrorOverlay(message: String) -> NSView {
+    /// The SSO card (issue #49) has its own title and makes guided manual sign-in the default,
+    /// because trying again reaches the same blocked company sign-in page.
+    private func makeErrorOverlay(message: String, singleSignOn: Bool) -> NSView {
         let container = NSVisualEffectView()
         container.identifier = Self.loginOverlayIdentifier
         container.material = .hudWindow
@@ -615,7 +652,7 @@ class AuthManager: NSObject, ObservableObject {
         container.setAccessibilityRole(.group)
         container.setAccessibilityLabel("Sign-in problem")
 
-        let title = NSTextField(labelWithString: "Couldn’t finish sign-in")
+        let title = NSTextField(labelWithString: singleSignOn ? Self.ssoCardTitle : "Couldn’t finish sign-in")
         title.font = .preferredFont(forTextStyle: .title3) // scales with Dynamic Type (was fixed 15pt)
         title.alignment = .center
 
@@ -627,12 +664,14 @@ class AuthManager: NSObject, ObservableObject {
 
         let retry = NSButton(title: "Try again", target: self, action: #selector(overlayRetryTapped))
         retry.bezelStyle = .rounded
-        retry.keyEquivalent = "\r"
 
-        let manual = NSButton(title: "Sign in manually", target: self, action: #selector(overlayManualTapped))
+        let manual = NSButton(title: "Sign in manually", target: self,
+                              action: singleSignOn ? #selector(ssoManualSignInTapped) : #selector(overlayManualTapped))
         manual.bezelStyle = .rounded
 
-        let buttons = NSStackView(views: [retry, manual])
+        let defaultButton = singleSignOn ? manual : retry
+        defaultButton.keyEquivalent = "\r"
+        let buttons = NSStackView(views: singleSignOn ? [manual, retry] : [retry, manual])
         buttons.orientation = .horizontal
         buttons.spacing = 12
 
@@ -657,7 +696,57 @@ class AuthManager: NSObject, ObservableObject {
 
     // internal for @testable access in AuthManagerTests (error-overlay affordance tests)
     @objc func overlayManualTapped() {
-        onManualSignInRequested?()
+        requestManualSignIn(.general)
+    }
+
+    /// The SSO card's "Sign in manually" and the title-bar link (issue #49): the same
+    /// close-and-route, with Settings guiding the user to the paste field.
+    // internal for @testable access in AuthManagerTests
+    @objc func ssoManualSignInTapped() {
+        requestManualSignIn(.singleSignOn)
+    }
+
+    /// "Sign in manually instead", a borderless link on the trailing side of the sign-in window's
+    /// title bar. Starts hidden; `updateManualSignInLink` shows it.
+    static func makeManualSignInLinkAccessory(target: AuthManager) -> NSTitlebarAccessoryViewController {
+        let button = NSButton(title: "Sign in manually instead", target: target,
+                              action: #selector(ssoManualSignInTapped))
+        button.isBordered = false
+        button.font = .preferredFont(forTextStyle: .callout)
+        button.attributedTitle = NSAttributedString(string: button.title, attributes: [
+            .foregroundColor: NSColor.linkColor,
+            .font: button.font ?? NSFont.preferredFont(forTextStyle: .callout)
+        ])
+        button.translatesAutoresizingMaskIntoConstraints = false
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: button.intrinsicContentSize.width + 16, height: 28))
+        container.addSubview(button)
+        NSLayoutConstraint.activate([
+            button.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
+            button.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+        ])
+
+        let accessory = NSTitlebarAccessoryViewController()
+        accessory.layoutAttribute = .trailing
+        accessory.view = container
+        accessory.isHidden = true
+        return accessory
+    }
+
+    /// Show the title-bar link only while an SSO sign-in is on a WorkOS or Microsoft page and
+    /// the sign-in is idle: never over "Finishing sign-in" or the error card, which has its own
+    /// "Sign in manually".
+    private func updateManualSignInLink() {
+        guard let accessory = manualSignInLinkAccessory else { return }
+        let onSSOPage = lastAllowedMainFrameHost.map(Self.isSSONavigationHost) ?? false
+        let hide = !(ssoSignInActive && onSSOPage && loginState == .idle)
+        // Every login-state assignment lands here; skip unchanged writes so the title bar is not
+        // laid out again for nothing.
+        if accessory.isHidden != hide { accessory.isHidden = hide }
+    }
+
+    private func requestManualSignIn(_ reason: ManualSignInReason) {
+        onManualSignInRequested?(reason)
         loginState = .idle
         stopLoginWindow()
     }
@@ -674,6 +763,9 @@ class AuthManager: NSObject, ObservableObject {
         pendingCookieHeader = nil
         lastBlockedNavigation = nil
         lastNavFailure = nil
+        ssoSignInActive = false
+        lastAllowedMainFrameHost = nil
+        updateManualSignInLink()
     }
 
     /// Reset capture state and reload claude.ai/login in the existing login WebView.
@@ -1903,6 +1995,37 @@ class AuthManager: NSObject, ObservableObject {
         host.hasSuffix(".hcaptcha.com")
     }
 
+    /// The hosts a claude.ai single sign-on (SSO) passes through on its way to a company's
+    /// Microsoft Entra sign-in and back (issue #49): WorkOS, which claude.ai hands SSO to, and the
+    /// Microsoft sign-in, password-reset and MFA-registration hosts a first-time or expired-password
+    /// sign-in reaches mid-flow. Exact hosts only, with no subdomains: none of them serves pages a
+    /// user can create. `login.live.com` (personal Microsoft accounts) is left out on purpose.
+    static let ssoNavigationHosts: Set<String> = [
+        "api.workos.com",
+        "auth.workos.com",
+        "login.microsoftonline.com",
+        "login.microsoft.com",
+        "login.windows.net",
+        "passwordreset.microsoftonline.com",
+        "mysignins.microsoft.com",
+        "account.activedirectory.windowsazure.com"
+    ]
+
+    /// claude.ai itself or one of its subdomains: the apex with `==` and subdomains with a
+    /// leading-dot `hasSuffix` (pattern #2), so `evil-claude.ai` does not match. Shared by the
+    /// session-cookie pin and the SSO-active reset so the two cannot drift apart.
+    static func isClaudeHost(_ host: String) -> Bool {
+        host == "claude.ai" || host.hasSuffix(".claude.ai")
+    }
+
+    /// Whether `host` is one of `ssoNavigationHosts`. Consulted for main-frame and subframe
+    /// navigation in the login window only, never for popups: a popup covers the whole login view
+    /// with no close control, so `allowsOAuthPopup` keeps `isAllowedDomain` alone.
+    // internal for @testable access in AuthManagerTests
+    static func isSSONavigationHost(_ host: String) -> Bool {
+        ssoNavigationHosts.contains(host)
+    }
+
     /// Whether a `window.open()` to `url` should spawn an OAuth popup. Pattern #7: the `about:`
     /// scheme check MUST precede the host check - `about:blank` (Google's OAuth bootstrap) has
     /// no host, so a host guard placed first would silently block it and break Google sign-in.
@@ -1930,10 +2053,17 @@ class AuthManager: NSObject, ObservableObject {
         case subframe
     }
 
-    /// The error copy for a blocked single sign-on hop. A compile-time literal that never
-    /// interpolates the host: the blocked host is a company identity provider, and it belongs in
-    /// the opt-in diagnostics record, not in the `login-state` line every error emits.
-    static let ssoBlockedMessage = "This sign-in window can't complete single sign-on (SSO). Choose \"Continue with email\" and enter the code Claude sends you, or use Sign in manually to paste your cookie header under Settings."
+    /// The error copy for a blocked hop outside a known SSO hand-off. It still names single
+    /// sign-on, because an unlisted company sign-in host is the likeliest cause. A compile-time
+    /// literal that never interpolates the host: the blocked host is a company identity provider,
+    /// and it belongs in the opt-in diagnostics record, not in the `login-state` line every error
+    /// emits.
+    static let ssoBlockedMessage = "This sign-in window can't open that page. If your company uses single sign-on (SSO), choose Sign in manually to copy your session from your browser into Settings."
+
+    /// The SSO card's copy (issue #49), for a block after the sign-in reached WorkOS or Microsoft.
+    /// Static literals for the same reason as `ssoBlockedMessage`.
+    static let ssoCardTitle = "Your company's sign-in can't open here"
+    static let ssoCardMessage = "This window can't show your company's single sign-on (SSO) page. You can still sign in: choose Sign in manually to copy your session from Safari or Chrome into Settings."
 
     /// Classify a blocked navigation from what the delegate can see. Pure and static so the table
     /// is unit-testable without a WebKit frame. A nil target frame is a new window: a link click
@@ -1995,7 +2125,7 @@ class AuthManager: NSObject, ObservableObject {
         }
 
         guard loginState == .idle, !hasCapturedSession else { return }
-        loginState = .error(Self.ssoBlockedMessage)
+        loginState = .error(kind == .main && ssoSignInActive ? Self.ssoCardMessage : Self.ssoBlockedMessage)
     }
 
     /// Fully retire the mounted popup: clear its delegate pointers and nil our reference, so a
@@ -2041,19 +2171,35 @@ extension AuthManager: WKNavigationDelegate {
             return
         }
 
-        if isAllowedDomain(host) {
+        let onPopup = webView === popupWebView
+        let isMainFrame = navigationAction.targetFrame?.isMainFrame ?? false
+        // SSO hosts only in a frame of the login window: a nil target frame asks for a new
+        // window, and a popup may load only the original list.
+        let isSSOHost = !onPopup && navigationAction.targetFrame != nil && Self.isSSONavigationHost(host)
+
+        if isAllowedDomain(host) || isSSOHost {
             logger.debug("Navigation allowed: \(host)")
+            if isMainFrame && !onPopup {
+                if isSSOHost {
+                    ssoSignInActive = true
+                } else if Self.isClaudeHost(host) {
+                    ssoSignInActive = false
+                }
+                lastAllowedMainFrameHost = host
+                updateManualSignInLink()
+            }
             // U6 diagnostics: decision + host only (never url.absoluteString — it may carry
             // query params). Written to the exported diag-*.jsonl through the same injected
-            // sink as the block branch, so a test can read both decisions back.
-            diagnostics.emitMilestone(kind: "nav-decision", payload: ["decision": "allow", "host": host])
+            // sink as the block branch, so a test can read both decisions back. The host goes
+            // through the same validator as a blocked one (issue #49).
+            diagnostics.emitMilestone(kind: "nav-decision", payload: ["decision": "allow", "host": Self.hostForDiagnostics(host)])
             decisionHandler(.allow)
         } else {
             let kind = Self.navigationBlockKind(
-                isMainFrame: navigationAction.targetFrame?.isMainFrame ?? false,
+                isMainFrame: isMainFrame,
                 targetFrameIsNil: navigationAction.targetFrame == nil,
                 navigationType: navigationAction.navigationType,
-                onPopup: webView === popupWebView
+                onPopup: onPopup
             )
             recordBlockedNavigation(host: host, kind: kind)
             decisionHandler(.cancel)
@@ -2098,7 +2244,7 @@ extension AuthManager: WKNavigationDelegate {
               // party (accounts.google.com, *.gstatic.com, …) deliver a
               // `Set-Cookie: sessionKey=…; Domain=.claude.ai` that Foundation's parser honors —
               // a session-fixation vector (critical pattern #2). Pin to claude.ai.
-              host == "claude.ai" || host.hasSuffix(".claude.ai") else { return }
+              Self.isClaudeHost(host) else { return }
 
         captureSessionCookie(from: Self.sessionCookies(fromResponseHeaders: httpResponse.allHeaderFields, url: url))
     }

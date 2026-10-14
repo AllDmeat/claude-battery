@@ -317,6 +317,40 @@ public class ClaudeApiTests
         Assert.False(ex.LooksLikeCloudflareBlock); // a 401 is a genuine auth failure, never a CF block
     }
 
+    /// <summary>Verbatim body claude.ai returned to a Moscow IP on 2026-10-06 (VPN off).</summary>
+    private const string RegionUnavailableBody =
+        "{\"type\":\"error\",\"error\":{\"type\":\"permission_error\",\"message\":\"Claude isn't available in your region.\",\"details\":{\"error_code\":\"region_unavailable\",\"error_visibility\":\"user_facing\"}}}";
+
+    [Fact]
+    public async Task AuthException_403RegionUnavailable_FlagsRegion_NotCloudflare()
+    {
+        var handler = new CapturingHandler(_ => AuthResponse(HttpStatusCode.Forbidden, body: RegionUnavailableBody));
+        using var client = new HttpClient(handler);
+        var api = new ClaudeApi(client, TestUserAgent);
+
+        var ex = await Assert.ThrowsAsync<ClaudeAuthException>(() => api.GetUsageAsync("org-1", CancellationToken.None));
+        Assert.Equal(403, ex.StatusCode);
+        Assert.True(ex.IsRegionUnavailable);
+        Assert.False(ex.LooksLikeCloudflareBlock);
+        Assert.DoesNotContain("region", ex.Message, StringComparison.OrdinalIgnoreCase); // body not echoed
+    }
+
+    [Theory]
+    [InlineData(403, "application/json", "{\"type\":\"error\",\"error\":{\"type\":\"permission_error\",\"message\":\"Invalid authorization\",\"details\":{\"error_code\":\"account_session_invalid\"}}}")]
+    [InlineData(403, "application/json", "")]
+    [InlineData(403, "application/json", "not json")]
+    [InlineData(403, "text/html", "{\"error\":{\"details\":{\"error_code\":\"region_unavailable\"}}}")]
+    [InlineData(401, "application/json", "{\"error\":{\"details\":{\"error_code\":\"region_unavailable\"}}}")]
+    public async Task AuthException_OtherBodies_AreNotRegionUnavailable(int status, string contentType, string body)
+    {
+        var handler = new CapturingHandler(_ => AuthResponse((HttpStatusCode)status, contentType: contentType, body: body));
+        using var client = new HttpClient(handler);
+        var api = new ClaudeApi(client, TestUserAgent);
+
+        var ex = await Assert.ThrowsAsync<ClaudeAuthException>(() => api.GetUsageAsync("org-1", CancellationToken.None));
+        Assert.False(ex.IsRegionUnavailable);
+    }
+
     [Fact]
     public void ClaudeAuthException_SingleArgCtor_DefaultsCloudflareBlockFalse()
     {
@@ -350,7 +384,7 @@ public class ClaudeApiTests
             .Select(p => p.Name)
             .OrderBy(n => n, StringComparer.Ordinal)
             .ToArray();
-        Assert.Equal(new[] { "LooksLikeCloudflareBlock", "StatusCode" }, declaredProps);
+        Assert.Equal(new[] { "IsRegionUnavailable", "LooksLikeCloudflareBlock", "StatusCode" }, declaredProps);
     }
 
     [Fact]

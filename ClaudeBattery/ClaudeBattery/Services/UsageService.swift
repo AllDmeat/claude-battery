@@ -11,6 +11,9 @@ class UsageService: NSObject, ObservableObject {
     @Published var lastSuccessfulFetch: Date?
     @Published private(set) var consecutiveFailures: Int = 0
     @Published private(set) var authFailed: Bool = false
+    /// The last poll was refused with `region_unavailable` (a VPN that dropped). Transient, not an
+    /// expired session: polling keeps going on the failure backoff and recovers on its own.
+    @Published private(set) var regionUnavailable: Bool = false
 
     private enum Constants {
         static let staleThresholdSeconds: TimeInterval = 660
@@ -97,6 +100,14 @@ class UsageService: NSObject, ObservableObject {
         lastSuccessfulFetch = nil
         consecutiveFailures = 0
         authFailed = false
+        regionUnavailable = false
+        restartPolling()
+    }
+
+    /// The popover opened while polls are failing, or the user pressed Retry Now: retry now rather
+    /// than wait out a backoff of up to 30 minutes, so a VPN that came back shows fresh numbers.
+    func retryIfFailing() {
+        guard consecutiveFailures > 0, !authFailed, accountStore.activeAccount != nil else { return }
         restartPolling()
     }
 
@@ -152,9 +163,16 @@ class UsageService: NSObject, ObservableObject {
             _ = await previousTask?.value
             guard !Task.isCancelled else { return }
             await pollUsage()
+            // Re-arm from THIS poll's outcome. The timer armed below used the failure count from
+            // before the poll, so a retry that recovers after an hour of VPN being down would
+            // otherwise wait out a 30-minute backoff before the next refresh.
+            if !Task.isCancelled { scheduleNextPoll() }
         }
         scheduleNextPoll()
     }
+
+    /// When the next scheduled poll fires. Exposed for tests of the backoff re-arm.
+    var nextPollDate: Date? { timer?.fireDate }
 
     private func scheduleNextPoll() {
         timer?.invalidate()
@@ -195,6 +213,19 @@ class UsageService: NSObject, ObservableObject {
             guard let httpResponse = response as? HTTPURLResponse else {
                 consecutiveFailures += 1
                 logger.error("Non-HTTP response received")
+                return
+            }
+
+            // claude.ai answers 403 both for an expired session (`account_session_invalid`) and for
+            // a request from an unsupported region (`region_unavailable`, e.g. the VPN dropped).
+            // Only the first is a sign-out; the second backs off like any other failed poll.
+            // Re-derived from every HTTP answer, so a VPN that came back to a 500 stops blaming
+            // the VPN.
+            let isRegionBlock = httpResponse.statusCode == 403 && Self.isRegionUnavailable(data)
+            if regionUnavailable != isRegionBlock { regionUnavailable = isRegionBlock }
+            if isRegionBlock {
+                consecutiveFailures += 1
+                logger.warning("Region unavailable (HTTP 403), backing off")
                 return
             }
 
@@ -333,6 +364,15 @@ class UsageService: NSObject, ObservableObject {
     }
 
     var onAuthFailure: (() -> Void)?
+
+    /// True for claude.ai's `{"error":{"details":{"error_code":"region_unavailable"}}}` body.
+    nonisolated static func isRegionUnavailable(_ data: Data) -> Bool {
+        struct Body: Decodable {
+            struct Err: Decodable { struct Details: Decodable { let error_code: String? }; let details: Details? }
+            let error: Err?
+        }
+        return (try? JSONDecoder().decode(Body.self, from: data))?.error?.details?.error_code == "region_unavailable"
+    }
 
     // MARK: - Notifications
 

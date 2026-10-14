@@ -6,6 +6,8 @@ import UserNotifications
 struct SettingsView: View {
     @ObservedObject var accountStore: AccountStore
     let authManager: AuthManager
+    /// Only the menu bar's Settings window passes its guide in; the default never gets a request.
+    @ObservedObject var manualSignInGuide = ManualSignInGuide()
     let closeWindow: () -> Void
 
     @State private var launchAtLogin = false
@@ -19,8 +21,34 @@ struct SettingsView: View {
     /// Scales the decorative coffee-button font with Dynamic Type (the only fixed-size SwiftUI font
     /// in this view); the rest use semantic styles.
     @ScaledMetric(relativeTo: .body) private var coffeeFontSize: CGFloat = 20
+    /// Guided manual sign-in state (issue #49), owned here so the scroll, the help and the paste
+    /// field's focus all follow one SSO request.
+    @State private var showsSSOSteps = false
+    @State private var cookieHelpExpanded = false
+    @FocusState private var pasteFieldFocused: Bool
 
     var body: some View {
+        ScrollViewReader { proxy in
+            form
+                .onAppear { followGuide(proxy) }
+                .onChange(of: manualSignInGuide.hasPendingSSORequest) { _ in followGuide(proxy) }
+        }
+    }
+
+    /// An SSO request from the sign-in window scrolls to manual sign-in, opens its help with the
+    /// SSO steps, and focuses the paste field. Deferred one turn so the window has laid out and
+    /// become key, or the scroll and focus land on nothing.
+    private func followGuide(_ proxy: ScrollViewProxy) {
+        guard manualSignInGuide.takePendingSSORequest() else { return }
+        showsSSOSteps = true
+        cookieHelpExpanded = true
+        DispatchQueue.main.async {
+            withAnimation { proxy.scrollTo(ManualSignInSection.anchorID, anchor: .top) }
+            pasteFieldFocused = true
+        }
+    }
+
+    private var form: some View {
         Form {
             Section("Icon Style") {
                 Picker("Menu bar icon", selection: $iconStyleRaw) {
@@ -113,7 +141,10 @@ struct SettingsView: View {
             // (R9, issue #41). It must also stay visible at zero accounts, where Google-federated
             // and passkey users start: they cannot complete the embedded browser window at all, so
             // narrowing this to "some account exists" would break their first sign-in instead.
-            ManualSignInSection(authManager: authManager)
+            ManualSignInSection(authManager: authManager,
+                                showsSSOSteps: showsSSOSteps,
+                                cookieHelpExpanded: $cookieHelpExpanded,
+                                pasteFieldFocused: $pasteFieldFocused)
 
             DiagnosticsSection()
 
@@ -247,6 +278,11 @@ struct SettingsView: View {
 enum SettingsCopy {
     static let cookieHeaderHelp = "1. Sign in to claude.ai in your browser.\n2. Open Developer Tools (Option-Cmd-I) and select the Network tab.\n3. Refresh the page, then click any request to claude.ai.\n4. Under Request Headers, copy the entire value of the \"Cookie\" header.\n5. Paste it above. Paste it only here, never into a web page."
 
+    // Guided manual sign-in after a single sign-on (SSO) the sign-in window could not finish
+    // (issue #49). The same steps as `cookieHeaderHelp`, starting from an SSO sign-in in a browser.
+    static let ssoManualSignInIntro = "Your company's sign-in can't finish in the app's sign-in window. Sign in with SSO in your browser instead, then copy your session here."
+    static let ssoCookieHeaderHelp = "1. In Safari or Chrome, sign in to claude.ai with your company's single sign-on (SSO).\n2. Open Developer Tools (Option-Cmd-I) and select the Network tab.\n3. Refresh the page, then click any request to claude.ai.\n4. Under Request Headers, copy the entire value of the \"Cookie\" header.\n5. Paste it above. Paste it only here, never into a web page."
+
     // Says what is collected, not just what is not. The plan sample (R6) added a second kind of
     // record here - which plan the account is on and how much of each limit is left, written every
     // couple of minutes while logging is on - and a description that still said "sign-in events"
@@ -261,6 +297,13 @@ enum SettingsCopy {
 /// passkey-only accounts that cannot complete the embedded flow.
 private struct ManualSignInSection: View {
     let authManager: AuthManager
+    /// Set by a guided SSO request (issue #49): an SSO lead line and SSO-specific steps.
+    let showsSSOSteps: Bool
+    @Binding var cookieHelpExpanded: Bool
+    var pasteFieldFocused: FocusState<Bool>.Binding
+
+    /// Scroll target for a guided request.
+    static let anchorID = "manualSignIn"
 
     @State private var pasted = ""
     @State private var isResolving = false
@@ -275,11 +318,19 @@ private struct ManualSignInSection: View {
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+                .id(Self.anchorID)
+
+            if showsSSOSteps {
+                Text(SettingsCopy.ssoManualSignInIntro)
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             SecureField("Paste cookie header", text: $pasted)
                 .textFieldStyle(.roundedBorder)
                 .disableAutocorrection(true)
                 .accessibilityLabel("Cookie header")
+                .focused(pasteFieldFocused)
 
             HStack(spacing: 8) {
                 Button("Validate & Add") { validate() }
@@ -309,8 +360,8 @@ private struct ManualSignInSection: View {
                 Button("Use this organization") { chooseOrg() }
             }
 
-            DisclosureGroup("How do I find my cookie header?") {
-                Text(SettingsCopy.cookieHeaderHelp)
+            DisclosureGroup("How do I find my cookie header?", isExpanded: $cookieHelpExpanded) {
+                Text(showsSSOSteps ? SettingsCopy.ssoCookieHeaderHelp : SettingsCopy.cookieHeaderHelp)
                     .font(.caption)
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -382,6 +433,25 @@ private struct ManualSignInSection: View {
             statusIsError = true
             statusText = "Connection error. Please try again."
         }
+    }
+}
+
+/// Carries a guided manual sign-in request from the sign-in window into Settings (issue #49).
+/// The request is taken once, so reopening Settings later from the menu shows today's view.
+@MainActor
+final class ManualSignInGuide: ObservableObject {
+    @Published private(set) var hasPendingSSORequest = false
+
+    func request(_ reason: ManualSignInReason) {
+        guard reason == .singleSignOn else { return }
+        hasPendingSSORequest = true
+    }
+
+    /// Whether an SSO request was waiting. Clears it.
+    func takePendingSSORequest() -> Bool {
+        guard hasPendingSSORequest else { return false }
+        hasPendingSSORequest = false
+        return true
     }
 }
 

@@ -211,6 +211,14 @@ final class AuthManagerTests: XCTestCase {
         webView.subviews.contains { $0.identifier == AuthManager.loginOverlayIdentifier }
     }
 
+    /// Every view inside the mounted overlay, depth first, so a test can read the card's text and
+    /// buttons.
+    @MainActor
+    private func overlayViews(_ webView: WKWebView) -> [NSView] {
+        func flatten(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(flatten) }
+        return webView.subviews.filter { $0.identifier == AuthManager.loginOverlayIdentifier }.flatMap(flatten)
+    }
+
     @MainActor
     func testOverlay_shownOnSigningIn() {
         let auth = makeAuthManager()
@@ -824,6 +832,74 @@ final class AuthManagerTests: XCTestCase {
     }
 
     @MainActor
+    func testIsSSONavigationHost_exactWorkOSAndMicrosoftHostsOnly() {
+        // Issue #49: claude.ai's SSO hands off to WorkOS, then to Microsoft Entra. Exact hosts
+        // only, so a subdomain, a lookalike, or another company's login page stays blocked.
+        for host in ["api.workos.com", "auth.workos.com", "login.microsoftonline.com",
+                     "login.microsoft.com", "login.windows.net", "passwordreset.microsoftonline.com",
+                     "mysignins.microsoft.com", "account.activedirectory.windowsazure.com"] {
+            XCTAssertTrue(AuthManager.isSSONavigationHost(host), "\(host) should be allowed")
+        }
+        for host in ["api.workos.com.evil.com", "evilworkos.com", "workos.com", "x.api.workos.com",
+                     "x.auth.workos.com", "x.login.microsoftonline.com", "x.mysignins.microsoft.com",
+                     "microsoftonline.com", "forms.microsoft.com", "acme.okta.com", "x.authkit.app",
+                     "login.live.com"] {
+            XCTAssertFalse(AuthManager.isSSONavigationHost(host), "\(host) must be rejected")
+        }
+    }
+
+    @MainActor
+    func testIsClaudeHost_apexAndSubdomainsOnly() {
+        for host in ["claude.ai", "www.claude.ai", "a.b.claude.ai"] {
+            XCTAssertTrue(AuthManager.isClaudeHost(host), "\(host) should match")
+        }
+        for host in ["evil-claude.ai", "claude.ai.evil.com", "notclaude.ai", "claude.aix"] {
+            XCTAssertFalse(AuthManager.isClaudeHost(host), "\(host) must not match")
+        }
+    }
+
+    @MainActor
+    func testDecidePolicy_ssoHosts_allowedInWindowButNeverAsNewWindows() {
+        let auth = makeAuthManager()
+        let login = makeLoginWebView()
+        auth.loginWebView = login
+
+        XCTAssertEqual(decide(auth, login, makeMainFrameAction("https://api.workos.com/sso/authorize")), .allow)
+        XCTAssertEqual(decide(auth, login, makeSubframeAction("https://login.microsoftonline.com/t/saml2")), .allow)
+        let samlPost = WebKitFakes.action(url: "https://auth.workos.com/sso/saml/acs", targetFrame: WebKitFakes.frame(isMainFrame: true),
+                                          navigationType: .formSubmitted)
+        XCTAssertEqual(decide(auth, login, samlPost), .allow, "Microsoft's answer posted back to WorkOS goes through")
+        XCTAssertEqual(decide(auth, login, makeNilTargetAction("https://login.microsoftonline.com/t", navigationType: .other)), .cancel,
+                       "A new window to an SSO host is still refused")
+        XCTAssertFalse(auth.allowsOAuthPopup(for: URL(string: "https://login.microsoftonline.com/t")!),
+                       "Popups keep the original list")
+
+        let popup = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        login.addSubview(popup)
+        auth.popupWebView = popup
+        auth.resetLoginAttemptState()
+        XCTAssertFalse(auth.ssoSignInActive, "A fresh attempt starts outside SSO")
+        XCTAssertEqual(decide(auth, popup, makeMainFrameAction("https://login.microsoftonline.com/t")), .cancel,
+                       "An open popup cannot load an SSO host either")
+        XCTAssertFalse(auth.ssoSignInActive)
+    }
+
+    @MainActor
+    func testDecidePolicy_ssoSignInActive_setByWorkOS_keptThroughGoogle_clearedByClaude() {
+        let auth = makeAuthManager()
+        let login = makeLoginWebView()
+        auth.loginWebView = login
+        XCTAssertFalse(auth.ssoSignInActive)
+
+        decide(auth, login, makeMainFrameAction("https://api.workos.com/sso/authorize"))
+        XCTAssertTrue(auth.ssoSignInActive)
+        decide(auth, login, makeMainFrameAction("https://accounts.google.com/o/saml2"))
+        XCTAssertTrue(auth.ssoSignInActive, "A WorkOS-to-Google hop keeps the SSO signal")
+        decide(auth, login, makeMainFrameAction("https://claude.ai/sso-callback"))
+        XCTAssertFalse(auth.ssoSignInActive)
+    }
+
+    @MainActor
     func testAllowsOAuthPopup_schemeBeforeHost() {
         let auth = makeAuthManager()
         // about: bootstraps have no host and must be allowed BEFORE any host check (pattern #7).
@@ -871,12 +947,12 @@ final class AuthManagerTests: XCTestCase {
         let auth = makeAuthManager()
         auth.loginWebView = makeLoginWebView()
         auth.loginState = .error("boom")
-        var manualRequested = false
-        auth.onManualSignInRequested = { manualRequested = true }
+        var manualRequested: ManualSignInReason?
+        auth.onManualSignInRequested = { manualRequested = $0 }
 
         auth.overlayManualTapped()
 
-        XCTAssertTrue(manualRequested, "\"Sign in manually\" must invoke the hook that opens Settings")
+        XCTAssertEqual(manualRequested, .general, "\"Sign in manually\" must invoke the hook that opens Settings")
         XCTAssertEqual(auth.loginState, .idle)
         XCTAssertEqual(auth.loginOverlayKind, .none, "Overlay torn down")
     }
@@ -3578,10 +3654,12 @@ final class AuthManagerTests: XCTestCase {
         XCTAssertEqual(login.subviews.filter { $0.identifier == AuthManager.loginOverlayIdentifier }.count, 1,
                        "The overlay is built once, not once per retried hop")
 
-        // A different host is a new bounce and is recorded again.
-        decide(auth, login, makeMainFrameAction("https://login.microsoftonline.com/common/oauth2"))
-        XCTAssertEqual(records(kind: "nav-decision", from: diagnostics).map { $0["host"] as? String },
-                       ["acme.okta.com", "login.microsoftonline.com"])
+        // A different blocked host is a new bounce and is recorded again. (Microsoft sign-in hosts
+        // are allowed since issue #49, so this hop uses a company host that is still blocked.)
+        decide(auth, login, makeMainFrameAction("https://adfs.example.com/adfs/ls"))
+        let decisions = records(kind: "nav-decision", from: diagnostics)
+        XCTAssertEqual(decisions.map { $0["host"] as? String }, ["acme.okta.com", "adfs.example.com"])
+        XCTAssertEqual(decisions.map { $0["decision"] as? String }, ["block", "block"])
     }
 
     @MainActor
@@ -3691,6 +3769,25 @@ final class AuthManagerTests: XCTestCase {
         XCTAssertEqual(payload["decision"] as? String, "allow")
         XCTAssertEqual(payload["host"] as? String, "newassets.hcaptcha.com", "host only, never the path")
         XCTAssertEqual(auth.loginState, .idle, "An allowed subframe hop never touches the login state")
+    }
+
+    @MainActor
+    func testNavDecisionAllow_recordsValidatedHosts() {
+        // Issue #49 (R10): every host an SSO sign-in visits is in the export, validated the same
+        // way as blocked hosts, with no path or query.
+        let auth = makeAuthManager()
+        let login = makeLoginWebView()
+        auth.loginWebView = login
+        let diagnostics = makeDiagnostics()
+        auth.diagnostics = diagnostics
+
+        decide(auth, login, makeMainFrameAction("https://login.microsoftonline.com/t/oauth2/authorize?login_hint=LEAKED"))
+        // Allowed by the `.claude.ai` suffix, but not a valid host name.
+        XCTAssertEqual(decide(auth, login, makeSubframeAction("https://bad_host.claude.ai/frame")), .allow)
+
+        let decisions = records(kind: "nav-decision", from: diagnostics)
+        XCTAssertEqual(decisions.map { $0["host"] as? String }, ["login.microsoftonline.com", "(invalid)"])
+        XCTAssertTrue(decisions.allSatisfy { Set($0.keys) == ["decision", "host"] })
     }
 
     @MainActor
@@ -3806,6 +3903,148 @@ final class AuthManagerTests: XCTestCase {
         XCTAssertEqual(auth.loginState, .idle, "nav-failed never touches the login state")
     }
 
+    // MARK: - SSO card (issue #49)
+
+    @MainActor
+    func testDecidePolicy_mainBlockDuringSSO_showsSSOCardLeadingToGuidedManualSignIn() {
+        let auth = makeAuthManager()
+        let login = makeLoginWebView()
+        auth.loginWebView = login
+        let diagnostics = makeDiagnostics()
+        auth.diagnostics = diagnostics
+
+        decide(auth, login, makeMainFrameAction("https://api.workos.com/sso/authorize"))
+        XCTAssertEqual(decide(auth, login, makeMainFrameAction("https://adfs.example.com/adfs/ls")), .cancel)
+
+        XCTAssertEqual(auth.loginState, .error(AuthManager.ssoCardMessage))
+        XCTAssertEqual(auth.loginOverlayKind, .error)
+        let views = overlayViews(login)
+        let labels = views.compactMap { ($0 as? NSTextField)?.stringValue }
+        XCTAssertTrue(labels.contains(AuthManager.ssoCardTitle), "The SSO card has its own title")
+        XCTAssertFalse(labels.contains("Couldn\u{2019}t finish sign-in"))
+        let buttons = views.compactMap { $0 as? NSButton }
+        XCTAssertEqual(buttons.first { $0.keyEquivalent == "\r" }?.title, "Sign in manually",
+                       "Manual sign-in is the default action on the SSO card")
+        XCTAssertTrue(buttons.contains { $0.title == "Try again" })
+
+        let blocked = records(kind: "nav-decision", from: diagnostics).filter { $0["decision"] as? String == "block" }
+        XCTAssertEqual(blocked.first?["host"] as? String, "adfs.example.com", "The blocked company host is recorded")
+    }
+
+    @MainActor
+    func testDecidePolicy_mainBlockOutsideSSO_keepsTheGeneralCard() {
+        let auth = makeAuthManager()
+        let login = makeLoginWebView()
+        auth.loginWebView = login
+
+        decide(auth, login, makeMainFrameAction("https://acme.okta.com/app/sso"))
+
+        XCTAssertEqual(auth.loginState, .error(AuthManager.ssoBlockedMessage))
+        let views = overlayViews(login)
+        XCTAssertTrue(views.compactMap { ($0 as? NSTextField)?.stringValue }.contains("Couldn\u{2019}t finish sign-in"))
+        XCTAssertEqual(views.compactMap { $0 as? NSButton }.first { $0.keyEquivalent == "\r" }?.title, "Try again")
+    }
+
+    @MainActor
+    func testDecidePolicy_subframeBlockDuringSSO_recordsWithoutACard() {
+        let auth = makeAuthManager()
+        let login = makeLoginWebView()
+        auth.loginWebView = login
+        let diagnostics = makeDiagnostics()
+        auth.diagnostics = diagnostics
+
+        decide(auth, login, makeMainFrameAction("https://login.microsoftonline.com/t/oauth2/authorize"))
+        XCTAssertEqual(decide(auth, login, makeSubframeAction("https://tracker.example/pixel")), .cancel)
+
+        XCTAssertEqual(auth.loginState, .idle)
+        XCTAssertEqual(auth.loginOverlayKind, .none)
+        XCTAssertEqual(records(kind: "nav-decision", from: diagnostics).last?["kind"] as? String, "subframe")
+    }
+
+    @MainActor
+    func testSSOCardManualTapped_closesWindowAndRequestsGuidedManualSignIn() {
+        let auth = makeAuthManager()
+        auth.loginWebView = makeLoginWebView()
+        auth.loginState = .error(AuthManager.ssoCardMessage)
+        var requested: ManualSignInReason?
+        auth.onManualSignInRequested = { requested = $0 }
+
+        auth.ssoManualSignInTapped()
+
+        XCTAssertEqual(requested, .singleSignOn)
+        XCTAssertEqual(auth.loginState, .idle)
+        XCTAssertNil(auth.loginWebView, "The sign-in window is torn down")
+    }
+
+    // MARK: - Manual sign-in link (issue #49)
+
+    @MainActor
+    func testManualSignInLinkAccessory_trailingLinkStartsHidden() {
+        let auth = makeAuthManager()
+        let accessory = AuthManager.makeManualSignInLinkAccessory(target: auth)
+
+        XCTAssertEqual(accessory.layoutAttribute, .trailing)
+        XCTAssertTrue(accessory.isHidden)
+        let button = accessory.view.subviews.compactMap { $0 as? NSButton }.first
+        XCTAssertEqual(button?.title, "Sign in manually instead")
+        XCTAssertEqual(button?.action, #selector(AuthManager.ssoManualSignInTapped))
+    }
+
+    @MainActor
+    func testManualSignInLink_showsOnlyOnWorkOSOrMicrosoftPagesWhileIdle() {
+        let auth = makeAuthManager()
+        let login = makeLoginWebView()
+        auth.loginWebView = login
+        let accessory = AuthManager.makeManualSignInLinkAccessory(target: auth)
+        auth.manualSignInLinkAccessory = accessory
+
+        decide(auth, login, makeMainFrameAction("https://claude.ai/login"))
+        XCTAssertTrue(accessory.isHidden, "Hidden on claude.ai")
+
+        decide(auth, login, makeMainFrameAction("https://login.microsoftonline.com/t/oauth2/authorize"))
+        XCTAssertFalse(accessory.isHidden, "Visible on a Microsoft sign-in page")
+
+        auth.loginState = .signingIn
+        XCTAssertTrue(accessory.isHidden, "Hidden while sign-in is finishing")
+        auth.loginState = .idle
+        XCTAssertFalse(accessory.isHidden)
+        auth.loginState = .error("boom")
+        XCTAssertTrue(accessory.isHidden, "Hidden under the error card")
+        auth.loginState = .idle
+
+        decide(auth, login, makeMainFrameAction("https://accounts.google.com/o/saml2"))
+        XCTAssertTrue(accessory.isHidden, "Hidden on a page that is not WorkOS or Microsoft")
+        decide(auth, login, makeMainFrameAction("https://api.workos.com/sso/authorize"))
+        XCTAssertFalse(accessory.isHidden, "Visible on a WorkOS page")
+        decide(auth, login, makeSubframeAction("https://claude.ai/frame"))
+        XCTAssertFalse(accessory.isHidden, "A subframe does not change the page the window shows")
+
+        decide(auth, login, makeMainFrameAction("https://claude.ai/sso-callback"))
+        XCTAssertTrue(accessory.isHidden, "Hidden once the sign-in is back on claude.ai")
+    }
+
+    @MainActor
+    func testManualSignInLinkTapped_closesWindowAndRequestsGuidedManualSignIn() {
+        let auth = makeAuthManager()
+        auth.loginWebView = makeLoginWebView()
+        var requested: ManualSignInReason?
+        auth.onManualSignInRequested = { requested = $0 }
+
+        auth.ssoManualSignInTapped()
+
+        XCTAssertEqual(requested, .singleSignOn)
+        XCTAssertNil(auth.loginWebView, "The sign-in window is torn down")
+    }
+
+    @MainActor
+    func testSSOCardCopy_namesManualSignInAndNeverContinueWithEmail() {
+        for copy in [AuthManager.ssoCardTitle, AuthManager.ssoCardMessage, AuthManager.ssoBlockedMessage] {
+            XCTAssertFalse(copy.contains("Continue with email"), "SSO users are not sent to email sign-in: \(copy)")
+            XCTAssertFalse(copy.contains("\u{2014}"), "No em dashes in user-facing copy")
+        }
+        XCTAssertTrue(AuthManager.ssoCardMessage.contains("Sign in manually"))
+    }
+
     @MainActor
     func testSSOBlockedMessage_isStaticAndNamesTheRoute() {
         let copy = AuthManager.ssoBlockedMessage
@@ -3826,11 +4065,43 @@ final class AuthManagerTests: XCTestCase {
         XCTAssertFalse(SettingsCopy.cookieHeaderHelp.contains("\u{2014}"))
     }
 
+    // MARK: - Guided manual sign-in (issue #49)
+
+    @MainActor
+    func testManualSignInGuide_ssoRequestIsTakenOnce_generalRequestLeavesNothing() {
+        let guide = ManualSignInGuide()
+        XCTAssertFalse(guide.takePendingSSORequest())
+
+        guide.request(.general)
+        XCTAssertFalse(guide.takePendingSSORequest(),
+                       "A plain request keeps today's behavior: Settings only comes to the front")
+
+        guide.request(.singleSignOn)
+        XCTAssertTrue(guide.takePendingSSORequest(), "An SSO request guides Settings to the manual sign-in field")
+        XCTAssertFalse(guide.takePendingSSORequest(), "Taken once, so opening Settings later does not guide again")
+    }
+
+    @MainActor
+    func testSettingsCopy_ssoStepsStartWithSSOInTheBrowserAndKeepThePasteWarning() {
+        let steps = SettingsCopy.ssoCookieHeaderHelp
+        XCTAssertTrue(steps.hasPrefix("1. "), "Numbered steps")
+        XCTAssertTrue(steps.contains("single sign-on"), "Step 1 has the user sign in with SSO in a browser")
+        XCTAssertTrue(steps.contains("never into a web page"), "The paste warning stays")
+        XCTAssertFalse(steps.contains("Continue with email"))
+        XCTAssertFalse(SettingsCopy.ssoManualSignInIntro.contains("\u{2014}"))
+        XCTAssertFalse(steps.contains("\u{2014}"))
+    }
+
     @MainActor
     func testEmailCodeAlert_copyNamesSingleSignOn() {
         let copy = AuthManager.makeEmailCodeAlert().informativeText
-        XCTAssertTrue(copy.contains("single sign-on"),
-                      "The email-code sheet must list single sign-on beside Google and passkey as unavailable: \(copy)")
+        // Issue #49: SSO can now finish in the window for Microsoft Entra companies, and email
+        // sign-in is switched off where a company requires SSO, so SSO users are sent to SSO.
+        XCTAssertTrue(copy.contains("If your company uses single sign-on (SSO), choose SSO"),
+                      "The email-code sheet must send SSO users to SSO, not to email sign-in: \(copy)")
+        XCTAssertFalse(copy.contains("single sign-on (SSO) sign-in aren't available"),
+                       "SSO is no longer listed as unavailable in the window")
+        XCTAssertTrue(copy.contains("Google and passkey sign-in aren't available"))
     }
 
     @MainActor

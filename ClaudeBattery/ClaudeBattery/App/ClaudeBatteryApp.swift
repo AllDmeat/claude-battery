@@ -92,8 +92,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Route the login error overlay's "Sign in manually" button to the Settings paste
         // section (U5) so a user whose account can't complete the embedded flow has a floor.
-        authManager.onManualSignInRequested = { [weak self] in
-            self?.menuBarController.showSettings()
+        authManager.onManualSignInRequested = { [weak self] reason in
+            self?.menuBarController.showManualSignIn(for: reason)
         }
 
         // Set notification delegate early

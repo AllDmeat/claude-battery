@@ -662,6 +662,202 @@ final class UsageServicePollTests: XCTestCase {
         XCTAssertTrue(authCallbackFired)
     }
 
+    // MARK: - 403 region_unavailable (VPN dropped) is not a sign-out
+
+    /// Verbatim body claude.ai returned to a Moscow IP on 2026-10-06.
+    private let regionUnavailableBody = Data(#"{"type":"error","error":{"type":"permission_error","message":"Claude isn't available in your region.","details":{"error_code":"region_unavailable","error_visibility":"user_facing"}}}"#.utf8)
+
+    @MainActor
+    func testPoll403RegionUnavailable_backsOffWithoutSigningOut() async {
+        mockSession.responseData = regionUnavailableBody
+        mockSession.responseStatusCode = 403
+
+        let service = UsageService(
+            storage: storage,
+            accountStore: accountStore,
+            session: mockSession
+        )
+
+        var authCallbackFired = false
+        service.onAuthFailure = { authCallbackFired = true }
+
+        await service.pollUsage()
+
+        XCTAssertFalse(service.authFailed)
+        XCTAssertFalse(authCallbackFired)
+        XCTAssertTrue(service.regionUnavailable)
+        XCTAssertEqual(service.consecutiveFailures, 1)
+
+        // VPN back: the next successful poll clears the flag.
+        mockSession.responseData = fixtureData("usage_full")
+        mockSession.responseStatusCode = 200
+        await service.pollUsage()
+
+        XCTAssertFalse(service.regionUnavailable)
+        XCTAssertEqual(service.consecutiveFailures, 0)
+    }
+
+    /// VPN back, but claude.ai answers 500: the card must stop saying "Check your VPN".
+    @MainActor
+    func testRegionFlag_clearsOnANonRegionFailure() async {
+        mockSession.responseData = regionUnavailableBody
+        mockSession.responseStatusCode = 403
+
+        let service = UsageService(
+            storage: storage,
+            accountStore: accountStore,
+            session: mockSession
+        )
+
+        await service.pollUsage()
+        XCTAssertTrue(service.regionUnavailable)
+
+        mockSession.responseData = Data("{\"error\":\"internal\"}".utf8)
+        mockSession.responseStatusCode = 500
+        await service.pollUsage()
+
+        XCTAssertFalse(service.regionUnavailable)
+        XCTAssertEqual(service.consecutiveFailures, 2)
+    }
+
+    /// A retry that recovers after a long outage must re-arm at the base 2 minutes, not at the
+    /// backoff interval computed from the failure count before the retry ran.
+    @MainActor
+    func testRetryAfterBackoff_success_rearmsAtBaseInterval() async throws {
+        mockSession.responseData = regionUnavailableBody
+        mockSession.responseStatusCode = 403
+
+        let service = UsageService(
+            storage: storage,
+            accountStore: accountStore,
+            session: mockSession
+        )
+        defer { service.stopPolling() }
+
+        for _ in 0..<10 { await service.pollUsage() }
+        XCTAssertEqual(service.pollInterval, 1800) // deep in backoff
+
+        mockSession.responseData = fixtureData("usage_full")
+        mockSession.responseStatusCode = 200
+        service.retryIfFailing()
+
+        for _ in 0..<200 where service.consecutiveFailures != 0 || (service.nextPollDate?.timeIntervalSinceNow ?? .infinity) > 200 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        XCTAssertEqual(service.consecutiveFailures, 0)
+        let wait = try XCTUnwrap(service.nextPollDate).timeIntervalSinceNow
+        XCTAssertLessThanOrEqual(wait, 120)
+        XCTAssertGreaterThan(wait, 60)
+    }
+
+    /// retryIfFailing runs on every popover open. An expired session must stay stopped: a retry
+    /// would only send credentials already known bad.
+    @MainActor
+    func testRetryIfFailing_afterPlain403_staysStopped() async {
+        mockSession.responseData = Data()
+        mockSession.responseStatusCode = 403
+
+        let service = UsageService(
+            storage: storage,
+            accountStore: accountStore,
+            session: mockSession
+        )
+        defer { service.stopPolling() }
+
+        await service.pollUsage()
+        XCTAssertTrue(service.authFailed)
+        XCTAssertGreaterThan(service.consecutiveFailures, 0, "so only the authFailed check can stop the retry")
+        XCTAssertNil(service.nextPollDate)
+        let before = usageRequestCount()
+
+        service.retryIfFailing()
+
+        XCTAssertNil(service.nextPollDate, "an expired session must not be re-armed")
+        let polled = await waitUntil(timeout: 0.3) { usageRequestCount() > before }
+        XCTAssertFalse(polled, "an expired session must not be polled again")
+    }
+
+    /// The healthy side of the same popover open: nothing is failing, so nothing is retried.
+    @MainActor
+    func testRetryIfFailing_withNoFailures_doesNothing() async {
+        mockSession.responseData = fixtureData("usage_full")
+        mockSession.responseStatusCode = 200
+
+        let service = UsageService(
+            storage: storage,
+            accountStore: accountStore,
+            session: mockSession
+        )
+        defer { service.stopPolling() }
+
+        await service.pollUsage()
+        XCTAssertEqual(service.consecutiveFailures, 0)
+        XCTAssertFalse(service.authFailed, "so only the failure count can stop the retry")
+        XCTAssertNil(service.nextPollDate)
+        let before = usageRequestCount()
+
+        service.retryIfFailing()
+
+        XCTAssertNil(service.nextPollDate, "nothing is failing, so nothing is re-armed")
+        let polled = await waitUntil(timeout: 0.3) { usageRequestCount() > before }
+        XCTAssertFalse(polled, "opening the popover while polls succeed must not fetch again")
+    }
+
+    /// Removing the last account while region-blocked only stops polling, so the failure count
+    /// survives. A popover open then must not arm a timer for an account that is gone.
+    @MainActor
+    func testRetryIfFailing_withNoActiveAccount_doesNothing() async {
+        mockSession.responseData = regionUnavailableBody
+        mockSession.responseStatusCode = 403
+
+        let service = UsageService(
+            storage: storage,
+            accountStore: accountStore,
+            session: mockSession
+        )
+        defer { service.stopPolling() }
+
+        await service.pollUsage()
+        XCTAssertGreaterThan(service.consecutiveFailures, 0)
+        XCTAssertFalse(service.authFailed)
+        accountStore.removeAccount(testAccount.id)
+        XCTAssertNil(accountStore.activeAccount)
+
+        service.retryIfFailing()
+
+        XCTAssertNil(service.nextPollDate, "no active account, so nothing is re-armed")
+    }
+
+    /// Region state belongs to the account that hit it, so switching accounts starts clean.
+    @MainActor
+    func testSwitchAccount_clearsRegionUnavailable() async {
+        mockSession.responseData = regionUnavailableBody
+        mockSession.responseStatusCode = 403
+
+        let service = UsageService(
+            storage: storage,
+            accountStore: accountStore,
+            session: mockSession
+        )
+        defer { service.stopPolling() }
+
+        await service.pollUsage()
+        XCTAssertTrue(service.regionUnavailable)
+
+        // Checked before any await, so the poll switchAccount restarts has not run yet.
+        service.switchAccount()
+
+        XCTAssertFalse(service.regionUnavailable, "switchAccount should clear regionUnavailable")
+    }
+
+    func testIsRegionUnavailable_onlyMatchesTheRegionCode() {
+        XCTAssertTrue(UsageService.isRegionUnavailable(regionUnavailableBody))
+        XCTAssertFalse(UsageService.isRegionUnavailable(Data(#"{"type":"error","error":{"type":"permission_error","message":"Invalid authorization","details":{"error_code":"account_session_invalid"}}}"#.utf8)))
+        XCTAssertFalse(UsageService.isRegionUnavailable(Data("<!DOCTYPE html><title>Just a moment...</title>".utf8)))
+        XCTAssertFalse(UsageService.isRegionUnavailable(Data()))
+    }
+
     // MARK: - 500 server error
 
     @MainActor

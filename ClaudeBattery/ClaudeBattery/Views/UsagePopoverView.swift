@@ -103,6 +103,9 @@ struct UsagePopoverView: View {
                 authenticatedContent(usage: usage)
             } else if usageService.authFailed {
                 reauthContent
+            } else if usageService.regionUnavailable {
+                regionUnavailableCard()
+                    .padding(16)
             } else if usageService.consecutiveFailures >= 10 {
                 errorContent
             } else {
@@ -131,6 +134,12 @@ struct UsagePopoverView: View {
             // freshness line, so noticing an update cost you that line.
             // Renders nothing when no update is available, leaving the usual layout untouched.
             updateBanner()
+
+            // A dropped VPN keeps the last numbers on screen, so say plainly that they are stale
+            // and why, instead of leaving only the footer's "Usage updated N minutes ago".
+            if usageService.regionUnavailable {
+                regionUnavailableCard()
+            }
 
             LazyVGrid(columns: columns, spacing: 8) {
                 sessionCard(usage: usage)
@@ -787,6 +796,35 @@ struct UsagePopoverView: View {
         }
         .frame(maxWidth: .infinity, minHeight: 120)
         .padding(16)
+    }
+
+    /// claude.ai refused the request for the region (`region_unavailable`): Claude only works here
+    /// through a VPN, and the VPN dropped. Polling keeps going on its own backoff; Retry Now skips
+    /// the wait once the VPN is back. Shown above stale numbers, or alone when there are none.
+    private func regionUnavailableCard() -> some View {
+        VStack(spacing: 8) {
+            Image(systemName: "network.slash")
+                .font(PopoverTextSize.font(24, offset: textOffset))
+                .foregroundColor(.orange)
+            Text("Claude isn't available in your region")
+                .font(PopoverTextSize.font(11, weight: .semibold, offset: textOffset))
+                .multilineTextAlignment(.center)
+            Text("Check your VPN. Retrying automatically.")
+                .font(PopoverTextSize.font(10, offset: textOffset))
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+            // Label closure for the reason the "Try Again" button above spells out.
+            Button { usageService.retryIfFailing() } label: {
+                Text("Retry Now")
+                    .font(PopoverTextSize.font(13, offset: textOffset))
+            }
+            .buttonStyle(.borderedProminent)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity)
+        .background(Color.orange.opacity(0.12))
+        .background(Color(white: 0.15))
+        .cornerRadius(12)
     }
 
     private var errorContent: some View {
