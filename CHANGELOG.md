@@ -1,12 +1,6 @@
 # Change Log
 
-### Unreleased
-
-**Popover**
-- With one account, the link under the dials now reads "Add another account" instead of "Add Account", since an account already exists (issue #53).
-- The popover now opens with nothing selected for the keyboard. With macOS Keyboard navigation turned on, it used to put keyboard focus on the first button every time it opened, which drew a blue outline around the one-account link. Press Tab to move focus in, and the outline is drawn fresh at the current text size.
-
-### v1.74 beta 2
+### v1.75
 
 **Sign-in with single sign-on (SSO)**
 - "Sign in with SSO" can now finish inside the sign-in window for companies that use Microsoft Entra ID. The window used to block claude.ai's hand-off to WorkOS before the company's Microsoft page could load (issue #49). It now allows an exact list of WorkOS and Microsoft sign-in hosts, in the window itself only, never in popups. No wildcard host was added.
@@ -15,12 +9,16 @@
 - Manual sign-in from the SSO card or the link opens Settings at the manual sign-in field, with steps for copying your session from a browser where you signed in with SSO.
 - No sign-in message tells SSO users to choose "Continue with email" any more. Companies that require SSO switch email sign-in off, so that advice was a dead end.
 
-**Diagnostics**
-- Exports now record the host of every page the sign-in window allowed, checked the same way as blocked hosts, so an export shows which sign-in step was reached.
-
-**Dropped VPN no longer signs you out (beta 2)**
+**Dropped VPN no longer signs you out**
 - When a VPN drops, claude.ai answers usage requests with a 403 "region_unavailable". The app used to read that as an expired session, stop polling, and show "Session expired" until you signed in again. It now backs off and retries (2, 5, 10, then 30 minutes) and never signs you out. The popover shows a "Claude isn't available in your region" card with a Retry Now button, and opening the popover retries right away. Windows gets the same back-off (fix contributed by @AllDmeat in #58).
 - A retry that succeeds after a run of failures now refreshes at the normal interval again, instead of waiting out the longest backoff.
+
+**Popover**
+- With one account, the link under the dials now reads "Add another account" instead of "Add Account", since an account already exists (issue #53).
+- The popover now opens with nothing selected for the keyboard. With macOS Keyboard navigation turned on, it used to put keyboard focus on the first button every time it opened, which drew a blue outline around the one-account link. Press Tab to move focus in, and the outline is drawn fresh at the current text size.
+
+**Diagnostics**
+- Exports now record the host of every page the sign-in window allowed, checked the same way as blocked hosts, so an export shows which sign-in step was reached.
 
 ### v1.73
 
